@@ -22,6 +22,9 @@ class EMGProcessor:
                                                 maxlen=self.smooth_samples)
         self._activation = 0.0
         self._baseline = 0.0   # long-term IIR DC tracker
+        self._baseline_seeded = False
+        # τ ≈ 1 s regardless of sampling rate (0.998 at 500 Hz, 0.995 at 200 Hz)
+        self._alpha = float(np.exp(-1.0 / max(1, sampling_rate)))
 
     def push(self, samples: np.ndarray):
         """
@@ -35,10 +38,16 @@ class EMGProcessor:
             return
         ch = self.channel if self.channel < samples.shape[0] else 0
         sig = np.asarray(samples[ch], dtype=float)
+        if not self._baseline_seeded:
+            # Start the tracker at the current offset so a large DC (e.g. raw
+            # Ganglion electrode offset) doesn't look like a multi-second flex.
+            self._baseline = float(sig[0])
+            self._baseline_seeded = True
+        a, one_minus = self._alpha, 1.0 - self._alpha
         for v in sig:
-            # α = 0.998 → time constant ≈ 500 samples ≈ 1 s  (fast enough to remove
-            # slow electrode drift, slow enough not to eat the EMG envelope)
-            self._baseline = 0.998 * self._baseline + 0.002 * float(v)
+            # time constant ≈ 1 s (fast enough to remove slow electrode drift,
+            # slow enough not to eat the EMG envelope)
+            self._baseline = a * self._baseline + one_minus * float(v)
             self._rect_window.append(abs(float(v) - self._baseline))
         self._activation = float(np.mean(self._rect_window))
 
@@ -51,6 +60,7 @@ class EMGProcessor:
         self._rect_window = deque([0.0] * self.smooth_samples, maxlen=self.smooth_samples)
         self._activation = 0.0
         self._baseline = 0.0
+        self._baseline_seeded = False
 
     @staticmethod
     def compute_activation_from_window(display_data: np.ndarray, channel: int,

@@ -1,18 +1,24 @@
 """
 main.py — EMG BCI Workshop · PyQt6 + pyqtgraph
-Triton Neurotech · MindRove 4-Channel Armband / LSL
+Triton Neurotech · MindRove 4-Channel Armband / OpenBCI Ganglion
+
+Usage:
+  python main.py                 auto: LSL → OpenBCI UDP → MindRove SDK → synthetic
+  python main.py --ganglion      Ganglion direct over Bluetooth (close the OpenBCI GUI first)
+  python main.py --backend udp   OpenBCI GUI Networking widget, UDP/TimeSeries
+  python main.py --synthetic     no hardware (fake flexes every few seconds)
+  python main.py --keyboard      no hardware; hold SPACE to "flex" — for testing UI and game mechanics
 
 Keys:
   C         calibrate
   G         jump game
-  R         reaction challenge
   M         main menu
   1-8       select active EMG channel
-  SPACE     manual trigger (menu/game/reaction)
+  SPACE     manual trigger (menu/game)
   ESC       quit
 """
 
-import sys, time, threading
+import os, sys, time, math, threading, argparse
 import numpy as np
 
 from PyQt6.QtWidgets import (
@@ -23,7 +29,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPainterPath,
-    QKeyEvent,
+    QKeyEvent, QFontDatabase, QLinearGradient, QRadialGradient,
 )
 import pyqtgraph as pg
 
@@ -31,8 +37,7 @@ from emg_input import EMGInput
 from signal_processing import EMGProcessor
 from calibration import Calibration
 from controller import TriggerController
-from game import JumpGameLogic, GAME_W, GAME_H, GROUND_Y
-from reaction import ReactionLogic
+from game import JumpGameLogic, Player, Obstacle, Bird, Scenery, ERAS, GAME_W, GAME_H, GROUND_Y
 
 # ── pyqtgraph global config ───────────────────────────────────────────────────
 pg.setConfigOptions(antialias=True, useOpenGL=False)
@@ -44,106 +49,97 @@ CAL_DURATION_S  = 10
 DISPLAY_SECS_UI = 2.0
 DISABLED_CHANNELS: set[int] = set()
 
-# ── Colour palette ────────────────────────────────────────────────────────────
-C_BG     = QColor( 11,  15,  26)
-C_PANEL  = QColor( 20,  27,  46)
-C_PANEL2 = QColor( 28,  38,  62)
-C_BORDER = QColor( 42,  58,  94)
-C_TEXT   = QColor(232, 236, 248)
-C_DIM    = QColor( 90, 106, 148)
-C_ACCENT = QColor( 77, 159, 255)
-C_GREEN  = QColor(  0, 210, 110)
-C_RED    = QColor(255,  72,  72)
-C_YELLOW = QColor(255, 210,  50)
-C_GOLD   = QColor(255, 210,  50)
-C_SILVER = QColor(192, 192, 192)
-C_BRONZE = QColor(205, 127,  50)
+# ── Colour palette: "arctic pearl" ───────────────────────────────────────────
+# Cool pearl neutrals, one saturated arctic-blue accent for anything that means
+# "trigger", slate for signal traces and text.
+C_BG         = QColor(0xEE, 0xF3, 0xF8)
+C_PANEL      = QColor(0xFF, 0xFF, 0xFF)
+C_PANEL2     = QColor(0xDD, 0xE6, 0xEF)
+C_BORDER     = QColor(0xC9, 0xD5, 0xE2)
+C_TEXT       = QColor(0x1E, 0x2A, 0x38)
+C_DIM        = QColor(0x66, 0x77, 0x8B)
+C_ACCENT     = QColor(0x2E, 0x96, 0xD6)
+C_SIGNAL     = QColor(0x2B, 0x3F, 0x55)
+C_SIGNAL_DIM = QColor(0xB5, 0xC4, 0xD3)
+C_GREEN      = QColor(0x2F, 0xAF, 0x77)
+C_RED        = QColor(0xE0, 0x4E, 0x4E)
+C_YELLOW     = C_ACCENT
+C_BRAIN      = QColor(0xF2, 0xB3, 0x3D)
 
-CH_COLORS = [
-    QColor( 77, 159, 255),  # CH1 blue
-    QColor(  0, 210, 110),  # CH2 green
-    QColor(255, 210,  50),  # CH3 yellow
-    QColor(255, 128, 171),  # CH4 pink
-    QColor(186, 104, 255),  # CH5 purple
-    QColor(255, 165,  50),  # CH6 orange
-    QColor( 64, 224, 208),  # CH7 teal
-    QColor(200, 200, 200),  # CH8 grey
-]
-CH_HEX = [c.name() for c in CH_COLORS]
+# Game: pastel sunrise
+G_SKY        = [(0.00, QColor(0xA9, 0xC4, 0xF2)), (0.50, QColor(0xE9, 0xC7, 0xDF)),
+                (0.82, QColor(0xFA, 0xCF, 0xBE)), (1.00, QColor(0xFC, 0xE4, 0xC0))]
+G_SUN        = QColor(0xFF, 0xE7, 0xA8)
+G_SUN_GLOW   = QColor(0xFF, 0xD9, 0x8E)
+G_GROUND     = QColor(0xEA, 0xE0, 0xF5)
+G_GROUND_LN  = QColor(0x9A, 0x8C, 0xC4)
+G_TICK       = QColor(0xC9, 0xBD, 0xE4)
+G_CLOUD      = QColor(0xFF, 0xFF, 0xFF, 215)
+G_OBST       = QColor(0x5F, 0x7D, 0x90)
+G_OVERLAY    = QColor(0xFF, 0xFF, 0xFF, 150)
+
+FONT_UI   = "Manrope"        # bundled in ./fonts, loaded by load_fonts()
+FONT_MONO = "DM Mono"
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+
+
+def load_fonts():
+    """Register the bundled fonts; fall back to system fonts if they're missing."""
+    global FONT_UI, FONT_MONO
+    ok_ui = ok_mono = False
+    if os.path.isdir(FONTS_DIR):
+        for name in sorted(os.listdir(FONTS_DIR)):
+            if not name.lower().endswith(".ttf"):
+                continue
+            fid = QFontDatabase.addApplicationFont(os.path.join(FONTS_DIR, name))
+            fams = QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []
+            ok_ui   |= "Manrope" in fams
+            ok_mono |= "DM Mono" in fams
+    if not ok_ui:
+        FONT_UI = "Avenir Next" if "Avenir Next" in QFontDatabase.families() else "Helvetica Neue"
+    if not ok_mono:
+        FONT_MONO = "Menlo"
+
 
 # ── Stylesheet ────────────────────────────────────────────────────────────────
 STYLESHEET = """
-* {
-    font-family: "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
-}
-QMainWindow, QWidget {
-    background-color: #0B0F1A;
-    color: #E8ECF8;
-}
-QLabel { background: transparent; color: #E8ECF8; }
+* { font-family: "__UI__", "Avenir Next", "Helvetica Neue", Arial, sans-serif; }
+QMainWindow, QWidget { background-color: #EEF3F8; color: #1E2A38; }
+QLabel { background: transparent; color: #1E2A38; }
 QPushButton {
-    background-color: #141B2E;
-    border: 1px solid #2A3A5E;
-    border-radius: 8px;
-    color: #E8ECF8;
-    padding: 6px 14px;
-    min-height: 28px;
+    background-color: #FFFFFF;
+    border: 1px solid #C9D5E2;
+    border-radius: 7px;
+    color: #1E2A38;
+    padding: 7px 16px;
+    min-height: 26px;
     font-size: 13px;
+    font-weight: 600;
 }
-QPushButton:hover {
-    background-color: #1C263E;
-    border-color: #4D9FFF;
+QPushButton:hover   { background-color: #F6F9FC; border-color: #8FA3B8; }
+QPushButton:pressed { background-color: #DDE6EF; }
+QPushButton:checked { background-color: #2E96D6; border-color: #2E96D6; color: #FFFFFF; }
+QPushButton[primary="true"] {
+    background-color: #2E96D6; border: 1px solid #2E96D6; color: #FFFFFF;
 }
-QPushButton:checked {
-    background-color: #4D9FFF;
-    color: #0B0F1A;
-    font-weight: bold;
-    border-color: #4D9FFF;
-}
-QPushButton:pressed { background-color: #3A7ACC; }
+QPushButton[primary="true"]:hover { background-color: #4FAAE3; border-color: #4FAAE3; }
+QPushButton[nav="true"] { min-height: 52px; font-size: 14px; }
 QLineEdit {
-    background-color: #141B2E;
-    border: 1px solid #2A3A5E;
-    border-radius: 8px;
-    color: #E8ECF8;
-    padding: 8px 14px;
-    font-size: 18px;
-    selection-background-color: #4D9FFF;
+    background-color: #FFFFFF; border: 1px solid #C9D5E2; border-radius: 7px;
+    color: #1E2A38; padding: 8px 14px; font-size: 17px;
+    selection-background-color: #2E96D6;
 }
-QLineEdit:focus { border-color: #4D9FFF; }
-QSlider::groove:horizontal {
-    height: 6px;
-    background: #1C263E;
-    border-radius: 3px;
-}
+QLineEdit:focus { border-color: #2E96D6; }
+QSlider::groove:horizontal { height: 4px; background: #C9D5E2; border-radius: 2px; }
 QSlider::handle:horizontal {
-    width: 22px; height: 22px;
-    margin: -8px 0;
-    background: #FFD232;
-    border-radius: 11px;
-    border: 2px solid #E8ECF8;
+    width: 18px; height: 18px; margin: -7px 0; background: #2E96D6; border-radius: 9px;
 }
-QSlider::sub-page:horizontal {
-    background: #4D9FFF;
-    border-radius: 3px;
-}
+QSlider::sub-page:horizontal { background: #2E96D6; border-radius: 2px; }
 """
 
-NAV_BTN_CSS = """
-QPushButton {{
-    background-color: {bg};
-    border: none;
-    border-radius: 12px;
-    color: #E8ECF8;
-    font-size: 15px;
-    font-weight: bold;
-    padding: 14px 10px;
-    min-height: 68px;
-}}
-QPushButton:hover {{ background-color: {hover}; border: 2px solid #E8ECF8; }}
-QPushButton:pressed {{ background-color: #0B0F1A; }}
-"""
 
+def build_stylesheet() -> str:
+    return STYLESHEET.replace("__UI__", FONT_UI)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility helpers
@@ -153,23 +149,41 @@ def _sep() -> QFrame:
     f = QFrame()
     f.setFrameShape(QFrame.Shape.HLine)
     f.setFixedHeight(1)
-    f.setStyleSheet("background: #2A3A5E; border: none;")
+    f.setStyleSheet("background: #C9D5E2; border: none;")
     return f
 
 
 def _lbl(text: str, size: int = 13, bold: bool = False,
          color: QColor | None = None) -> QLabel:
     w = QLabel(text)
-    f = w.font()
-    f.setPointSize(size)
-    if bold:
-        f.setBold(True)
+    f = QFont(FONT_UI, size)
+    f.setWeight(QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
     w.setFont(f)
     if color:
         pal = w.palette()
         pal.setColor(w.foregroundRole(), color)
         w.setPalette(pal)
     return w
+
+
+def _btn(text: str, primary: bool = False, nav: bool = False,
+         width: int | None = None) -> QPushButton:
+    b = QPushButton(text)
+    if primary:
+        b.setProperty("primary", "true")
+    if nav:
+        b.setProperty("nav", "true")
+    if width:
+        b.setFixedWidth(width)
+    return b
+
+
+def _set_primary(b: QPushButton, primary: bool):
+    if (b.property("primary") == "true") == primary:
+        return
+    b.setProperty("primary", "true" if primary else "false")
+    b.style().unpolish(b)
+    b.style().polish(b)
 
 
 def probe_channel_metrics(emg: EMGInput, settle_s: float = 0.5,
@@ -204,117 +218,172 @@ def choose_default_channel(metrics: list[tuple[float, float]], n_ch: int) -> int
 # Shared Widgets
 # ─────────────────────────────────────────────────────────────────────────────
 
-class EMGMultiPlot(pg.GraphicsLayoutWidget):
+class EMGMultiPlot(QWidget):
     """
-    Stacked multi-channel EMG display via pyqtgraph.
-    Each channel has its own PlotItem so Y-scales are independent.
+    One row per channel: a label column (name + scale) and a trace.
+    Active channel: bright line with a soft fill and its threshold.
+    Others: dim line. Y-scale auto-ranges per channel, smoothed.
     """
 
-    def __init__(self, n_channels: int = 4, parent=None):
+    def __init__(self, n_channels: int = 4, labels: list[str] | None = None,
+                 parent=None):
         super().__init__(parent)
         self.n_channels = n_channels
-        self.setBackground(C_BG)
-        self.ci.layout.setSpacing(1)
-        self.ci.layout.setContentsMargins(4, 4, 4, 4)
+        labels = list(labels) if labels else [f"CH{i + 1}" for i in range(n_channels)]
 
-        self._plots:      list[pg.PlotItem]     = []
-        self._curves:     list[pg.PlotDataItem] = []
-        self._thr_lines:  list[pg.InfiniteLine] = []
-        self._ch_labels:  list[pg.TextItem]     = []
-        self._sc_labels:  list[pg.TextItem]     = []
+        self._plots:     list[pg.PlotItem]     = []
+        self._curves:    list[pg.PlotDataItem] = []
+        self._envs:      list[tuple]           = []
+        self._thr_lines: list[pg.InfiniteLine] = []
+        self._name_lbls: list[QLabel]          = []
+        self._scale_lbls: list[QLabel]         = []
+        self._scale:     list[float]           = [60.0] * n_channels
+        self._applied:   list[float]           = [0.0] * n_channels
+        self._active_prev: int                 = -1
+        self._n_prev: int                      = -1
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
 
         for i in range(n_channels):
-            p = self.addPlot(row=i, col=0)
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 6, 0, 6)
+            row.setSpacing(14)
+
+            col = QVBoxLayout()
+            col.setContentsMargins(0, 2, 0, 0)
+            col.setSpacing(2)
+            name = _lbl(labels[i], 12, color=C_DIM)
+            name.setFont(QFont(FONT_MONO, 12))
+            scale = _lbl("", 9, color=C_DIM)
+            scale.setFont(QFont(FONT_MONO, 9))
+            col.addWidget(name)
+            col.addWidget(scale)
+            col.addStretch()
+            colw = QWidget()
+            colw.setLayout(col)
+            colw.setFixedWidth(76)
+            row.addWidget(colw)
+
+            pw = pg.PlotWidget(background=C_BG)
+            pw.setFrameStyle(0)
+            p = pw.getPlotItem()
             p.setMouseEnabled(False, False)
-            p.hideAxis('bottom')
             p.setMenuEnabled(False)
-            p.setDefaultPadding(0.02)
-            ax = p.getAxis('left')
-            ax.setStyle(tickLength=0, showValues=False)
-            ax.setWidth(4)
+            p.hideButtons()
+            p.hideAxis('bottom')
+            p.hideAxis('left')
+            p.setDefaultPadding(0.0)
+            p.setContentsMargins(0, 0, 0, 0)
+            p.getViewBox().setBackgroundColor(C_BG)
 
-            color = CH_HEX[i]
-            curve = p.plot(pen=pg.mkPen(color=color, width=1.5))
-
-            ch_lbl = pg.TextItem(
-                text=f'CH{i + 1}', color=color, anchor=(0, 0),
-                fill=pg.mkBrush(C_BG.red(), C_BG.green(), C_BG.blue(), 180),
-            )
-            p.addItem(ch_lbl)
-
-            sc_lbl = pg.TextItem(text='', color=C_DIM.name(), anchor=(1, 0))
-            p.addItem(sc_lbl)
-
+            p.addLine(y=0, pen=pg.mkPen(C_BORDER, width=1))
+            raw = p.plot(pen=pg.mkPen(C_SIGNAL_DIM, width=1))
+            raw.setClipToView(True)
+            env_up = p.plot(pen=pg.mkPen(C_SIGNAL, width=1.4))
+            env_dn = p.plot(pen=pg.mkPen(C_SIGNAL, width=1.4))
+            fill = pg.FillBetweenItem(env_up, env_dn, brush=pg.mkBrush(43, 63, 85, 40))
+            p.addItem(fill)
+            curve = raw
             thr_line = p.addLine(
-                y=0,
-                pen=pg.mkPen(color='#FF4848', width=1,
-                             style=Qt.PenStyle.DashLine),
+                y=0, pen=pg.mkPen(C_ACCENT, width=1, style=Qt.PenStyle.DashLine)
             )
             thr_line.setVisible(False)
+            row.addWidget(pw, stretch=1)
+
+            v.addLayout(row, stretch=1)
+            if i < n_channels - 1:
+                v.addWidget(_sep())
 
             self._plots.append(p)
             self._curves.append(curve)
+            self._envs.append((env_up, env_dn, fill))
             self._thr_lines.append(thr_line)
-            self._ch_labels.append(ch_lbl)
-            self._sc_labels.append(sc_lbl)
+            self._name_lbls.append(name)
+            self._scale_lbls.append(scale)
+
+    def _style_curve(self, i: int, active: bool):
+        raw = self._curves[i]
+        env_up, env_dn, fill = self._envs[i]
+        if active:
+            raw.setPen(pg.mkPen(QColor(0x2B, 0x3F, 0x55, 38), width=1))
+            env_up.setPen(pg.mkPen(C_SIGNAL, width=1.4))
+            env_dn.setPen(pg.mkPen(C_SIGNAL, width=1.4))
+            fill.setBrush(pg.mkBrush(46, 150, 214, 55))
+            self._name_lbls[i].setStyleSheet("color: #1E2A38;")
+        else:
+            raw.setPen(pg.mkPen(QColor(0xB5, 0xC4, 0xD3, 70), width=1))
+            env_up.setPen(pg.mkPen(C_SIGNAL_DIM, width=1))
+            env_dn.setPen(pg.mkPen(C_SIGNAL_DIM, width=1))
+            fill.setBrush(pg.mkBrush(181, 196, 211, 50))
+            self._name_lbls[i].setStyleSheet("color: #66778B;")
+            self._scale_lbls[i].setText("")
 
     def update_data(self, data: np.ndarray, active_ch: int,
                     threshold: float = 0.0):
         n_avail = min(self.n_channels, data.shape[0])
+        if active_ch != self._active_prev:
+            for i in range(self.n_channels):
+                self._style_curve(i, i == active_ch)
+            self._active_prev = active_ch
+
+        n = data.shape[1]
+        if n != self._n_prev and n > 1:
+            for p in self._plots:
+                p.setXRange(0, n - 1, padding=0)
+            self._n_prev = n
+
         for i in range(self.n_channels):
-            p         = self._plots[i]
-            curve     = self._curves[i]
-            thr_line  = self._thr_lines[i]
+            p, curve, thr_line = self._plots[i], self._curves[i], self._thr_lines[i]
             is_active = (i == active_ch)
 
-            c = CH_COLORS[i]
-            if is_active:
-                color = c.name()
-                width = 2
-            else:
-                r = max(0, c.red()   - 55)
-                g = max(0, c.green() - 55)
-                b = max(0, c.blue()  - 55)
-                color = QColor(r, g, b).name()
-                width = 1
-            curve.setPen(pg.mkPen(color=color, width=width))
-
-            if i >= n_avail or data.shape[1] == 0:
+            if i >= n_avail or n == 0:
                 curve.setData([])
                 thr_line.setVisible(False)
                 continue
 
-            sig = data[i].astype(float)
-            dc  = float(np.mean(sig)) if len(sig) > 0 else 0.0
-            centered = sig - dc
+            sig = data[i] - float(np.mean(data[i]))
 
-            nonzero = np.abs(centered[np.abs(centered) > 1e-9])
-            scale = max(25.0, float(np.percentile(nonzero, 99)) * 2.2) \
-                if len(nonzero) > 10 else 80.0
+            # Smoothed rectified envelope (same ~90 ms window the trigger uses).
+            # The window length is derived from the trace length (DISPLAY_SECS_UI).
+            k   = max(3, int(n / DISPLAY_SECS_UI * 0.09))
+            env = np.convolve(np.abs(sig), np.ones(k) / k, mode='same')
 
-            curve.setData(centered)
-            p.setYRange(-scale, scale, padding=0)
-
-            xmax = len(centered) - 1 if len(centered) > 0 else 1
-            self._ch_labels[i].setPos(0, scale * 0.72)
-            self._sc_labels[i].setText(f'±{scale:.0f}µV')
-            self._sc_labels[i].setPos(xmax, scale * 0.72)
-
+            peak   = float(np.percentile(env, 99)) if n > 10 else 0.0
+            target = max(15.0, peak * 2.2)
             if is_active and threshold > 0:
-                thr_line.setVisible(True)
+                target = max(target, threshold * 1.5)
+            cur = self._scale[i]
+            cur += (target - cur) * (0.12 if target > cur else 0.02)
+            self._scale[i] = cur
+
+            curve.setData(sig, skipFiniteCheck=True)
+            env_up, env_dn, _ = self._envs[i]
+            env_up.setData(env, skipFiniteCheck=True)
+            env_dn.setData(-env, skipFiniteCheck=True)
+            if abs(cur - self._applied[i]) > cur * 0.015:
+                p.setYRange(-cur, cur, padding=0)
+                self._applied[i] = cur
+                if is_active:
+                    self._scale_lbls[i].setText(f"±{cur:.0f} µV")
+
+            show_thr = is_active and threshold > 0 and threshold < cur * 0.98
+            if show_thr:
                 thr_line.setValue(threshold)
-            else:
-                thr_line.setVisible(False)
+            if thr_line.isVisible() != show_thr:
+                thr_line.setVisible(show_thr)
 
 
 class ActivationBarWidget(QWidget):
-    """Horizontal activation bar with threshold marker and µV readout."""
+    """Thin horizontal activation meter with threshold tick and µV readout."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._activation = 0.0
         self._threshold  = 50.0
-        self.setFixedHeight(26)
+        self._max_v      = 100.0
+        self.setFixedHeight(22)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_values(self, activation: float, threshold: float):
@@ -326,93 +395,77 @@ class ActivationBarWidget(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        a, thr = self._activation, self._threshold
+        is_act = a >= thr
 
-        bar_w = self.width() - 120
-        bar_h = self.height()
-        r     = QRectF(0, 0, bar_w, bar_h)
-        rad   = bar_h / 2
+        text_w = 84
+        bar_w  = self.width() - text_w
+        bar_h  = 6.0
+        by     = (self.height() - bar_h) / 2
 
-        # Track
-        path = QPainterPath()
-        path.addRoundedRect(r, rad, rad)
-        p.fillPath(path, C_PANEL2)
+        target = max(thr * 2.2, a * 1.1, 40.0)
+        self._max_v += (target - self._max_v) * (0.3 if target > self._max_v else 0.03)
+        max_v = self._max_v
 
-        # Fill
-        a, thr  = self._activation, self._threshold
-        max_v   = max(thr * 2.5, a * 1.2, 50.0)
-        ratio   = min(1.0, a / max_v)
-        fill_w  = ratio * bar_w
-        is_act  = a >= thr
-        fill_c  = C_GREEN if is_act else C_ACCENT
-        if fill_w > 4:
+        track = QPainterPath()
+        track.addRoundedRect(QRectF(0, by, bar_w, bar_h), 3, 3)
+        p.fillPath(track, C_PANEL2)
+
+        fill_w = bar_w * min(1.0, a / max_v)
+        if fill_w > 2:
             fp = QPainterPath()
-            fp.addRoundedRect(QRectF(0, 0, fill_w, bar_h), rad, rad)
-            p.fillPath(fp, fill_c)
+            fp.addRoundedRect(QRectF(0, by, fill_w, bar_h), 3, 3)
+            p.fillPath(fp, C_ACCENT if is_act else C_SIGNAL)
 
-        # Threshold marker
-        if thr > 0 and max_v > 0:
-            tx = bar_w * thr / max_v
-            p.setPen(QPen(C_YELLOW, 2))
-            p.drawLine(QPointF(tx, -3), QPointF(tx, bar_h + 3))
+        if thr > 0:
+            tx = bar_w * min(1.0, thr / max_v)
+            p.setPen(QPen(C_ACCENT, 2))
+            p.drawLine(QPointF(tx, by - 5), QPointF(tx, by + bar_h + 5))
 
-        # Border
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(C_BORDER, 1))
-        p.drawPath(path)
-
-        # Value text
-        txt = f"{a:.1f} µV"
-        f2  = QFont()
-        f2.setPointSize(12)
-        p.setFont(f2)
+        p.setFont(QFont(FONT_MONO, 11))
         p.setPen(QPen(C_TEXT if is_act else C_DIM, 1))
-        p.drawText(QRectF(bar_w + 10, 0, 110, bar_h),
+        p.drawText(QRectF(bar_w + 12, 0, text_w - 12, self.height()),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                   txt)
+                   f"{a:5.1f} µV")
         p.end()
 
 
 class ChannelSelectorWidget(QWidget):
-    """Row of checkable channel buttons."""
+    """Row of checkable channel chips — one per channel the source exposes."""
     channel_changed = pyqtSignal(int)
 
     def __init__(self, n_channels: int, disabled: set[int] | None = None,
-                 parent=None):
+                 labels: list[str] | None = None, parent=None):
         super().__init__(parent)
         self.n_channels = n_channels
         self._disabled  = set(disabled or set())
         self._buttons: list[QPushButton] = []
+        labels = list(labels) if labels else [f"CH{i + 1}" for i in range(n_channels)]
 
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
         row.addWidget(_lbl("CHANNEL", 10, color=C_DIM))
+        row.addSpacing(4)
 
         for i in range(n_channels):
-            c   = CH_COLORS[i]
-            btn = QPushButton(f"CH{i + 1}" if i not in self._disabled
-                              else f"{i + 1}✕")
+            btn = QPushButton(labels[i])
             btn.setCheckable(True)
-            btn.setFixedSize(52, 26)
+            btn.setFixedSize(50, 24)
             btn.setEnabled(i not in self._disabled)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: #141B2E; border: 1px solid #2A3A5E;
-                    border-radius: 5px; color: #5A6A94;
-                    font-size: 11px; font-weight: bold;
-                }}
-                QPushButton:checked {{
-                    background: {c.name()}; border-color: {c.name()};
-                    color: #0B0F1A;
-                }}
-                QPushButton:hover:!checked {{
-                    border-color: {c.name()}; color: {c.name()};
-                }}
-            """)
+            btn.setFont(QFont(FONT_MONO, 10))
+            btn.setStyleSheet(
+                "QPushButton { padding: 0; min-height: 0; font-size: 11px; color: #66778B; }"
+                "QPushButton:checked { color: #FFFFFF; }"
+                "QPushButton:hover:!checked { color: #1E2A38; }"
+            )
             btn.clicked.connect(lambda _, idx=i: self.channel_changed.emit(idx))
             self._buttons.append(btn)
             row.addWidget(btn)
 
+        if n_channels == 1:
+            row.addSpacing(6)
+            row.addWidget(_lbl("single channel", 10, color=C_DIM))
         row.addStretch()
 
     def set_active(self, ch: int):
@@ -424,10 +477,58 @@ class ChannelSelectorWidget(QWidget):
 # Page: Main Menu
 # ─────────────────────────────────────────────────────────────────────────────
 
+class NavCard(QFrame):
+    """Clickable card: title, one-line description, keyboard key badge."""
+    clicked = pyqtSignal()
+
+    def __init__(self, title: str, subtitle: str, key: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("navcard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(74)
+        self._primary = None
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(18, 0, 16, 0)
+        row.setSpacing(12)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        self._title = _lbl(title, 15, bold=True)
+        self._sub   = _lbl(subtitle, 11, color=C_DIM)
+        col.addWidget(self._title)
+        col.addWidget(self._sub)
+        row.addLayout(col, stretch=1)
+
+        self._arrow = QLabel("→")
+        self._arrow.setFont(QFont(FONT_UI, 16))
+        self._arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._arrow.setFixedSize(30, 30)
+        row.addWidget(self._arrow)
+
+        self.set_primary(False)
+
+    def set_primary(self, primary: bool):
+        if self._primary == primary:
+            return
+        self._primary = primary
+        border = "#2E96D6" if primary else "#C9D5E2"
+        hover  = "#4FAAE3" if primary else "#66778B"
+        self.setStyleSheet(
+            f"QFrame#navcard {{ background:#FFFFFF; border:1px solid {border}; border-radius:8px; }}"
+            f"QFrame#navcard:hover {{ border-color:{hover}; }}"
+            "QLabel { border: none; background: transparent; }"
+        )
+        self._arrow.setStyleSheet(f"color: {'#2E96D6' if primary else '#66778B'};")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class MenuPage(QWidget):
     nav_calibrate   = pyqtSignal()
     nav_game        = pyqtSignal()
-    nav_reaction    = pyqtSignal()
     channel_changed = pyqtSignal(int)
 
     def __init__(self, emg: EMGInput, ctrl: TriggerController,
@@ -440,136 +541,123 @@ class MenuPage(QWidget):
 
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 18, 28, 14)
-        root.setSpacing(10)
+        root.setContentsMargins(32, 24, 32, 20)
+        root.setSpacing(12)
 
         # ── Header ─────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
         title_col = QVBoxLayout()
-        title_col.setSpacing(2)
-        title_col.addWidget(_lbl("EMG BCI WORKSHOP", 20, bold=True))
-        title_col.addWidget(_lbl("Triton Neurotech  ·  MindRove Armband",
-                                  11, color=C_DIM))
+        title_col.setSpacing(1)
+        title_col.addWidget(_lbl("EMG Workshop", 22, bold=True))
+        title_col.addWidget(_lbl("Triton Neurotech", 11, color=C_DIM))
         hdr.addLayout(title_col)
         hdr.addStretch()
-        self._status_lbl = _lbl("⬤  Connecting…", 11, color=C_YELLOW)
+        self._status_lbl = _lbl("● connecting", 11, color=C_DIM)
+        self._status_lbl.setFont(QFont(FONT_MONO, 11))
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         hdr.addWidget(self._status_lbl)
         root.addLayout(hdr)
-        root.addWidget(_sep())
+        root.addSpacing(4)
 
-        # ── Channel selector ────────────────────────────────────────────────
+        # ── Channel chips + flex pill ───────────────────────────────────────
+        top = QHBoxLayout()
         self._ch_sel = ChannelSelectorWidget(
-            self._emg.n_channels, DISABLED_CHANNELS
+            self._emg.n_channels, DISABLED_CHANNELS, self._emg.channel_labels
         )
         self._ch_sel.channel_changed.connect(self.channel_changed)
-        root.addWidget(self._ch_sel)
+        top.addWidget(self._ch_sel, stretch=1)
+        self._pill = _lbl("rest", 11)
+        self._pill.setFont(QFont(FONT_MONO, 11))
+        self._pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pill.setFixedSize(72, 24)
+        top.addWidget(self._pill)
+        root.addLayout(top)
 
         # ── Live EMG plot ───────────────────────────────────────────────────
-        self._plot = EMGMultiPlot(self._emg.n_channels)
+        self._plot = EMGMultiPlot(self._emg.n_channels, self._emg.channel_labels)
         self._plot.setSizePolicy(QSizePolicy.Policy.Expanding,
                                   QSizePolicy.Policy.Expanding)
         root.addWidget(self._plot, stretch=3)
 
         # ── Activation row ──────────────────────────────────────────────────
         act_row = QHBoxLayout()
-        act_row.addWidget(_lbl("ACTIVATION", 10, color=C_DIM))
-        act_row.addSpacing(8)
+        act_row.setSpacing(14)
+        act_lbl = _lbl("ACTIVATION", 10, color=C_DIM)
+        act_lbl.setFixedWidth(76)
+        act_row.addWidget(act_lbl)
         self._act_bar = ActivationBarWidget()
         act_row.addWidget(self._act_bar, stretch=1)
-        self._pill = _lbl("  rest  ", 11)
-        self._pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._pill.setFixedSize(76, 24)
-        self._pill.setStyleSheet(
-            "border-radius:12px; background:#1C263E; "
-            "color:#5A6A94; border:1px solid #2A3A5E;"
-        )
-        act_row.addWidget(self._pill)
         root.addLayout(act_row)
 
+        root.addSpacing(6)
         root.addWidget(_sep())
+        root.addSpacing(2)
 
-        # ── Calibration status ──────────────────────────────────────────────
-        self._cal_lbl = _lbl(
-            "⚠  Not calibrated — press Calibrate before playing",
-            12, color=C_DIM
-        )
-        self._cal_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # ── Calibration status + nav cards ──────────────────────────────────
+        self._cal_lbl = _lbl("Not calibrated — run calibration before playing",
+                             12, color=C_DIM)
         root.addWidget(self._cal_lbl)
 
-        # ── Nav buttons ─────────────────────────────────────────────────────
         nav = QHBoxLayout()
-        nav.setSpacing(14)
-
-        cal_btn = QPushButton("⚙   CALIBRATE")
-        cal_btn.setStyleSheet(
-            NAV_BTN_CSS.format(bg='#3A4FA0', hover='#4D64C8')
-        )
-        cal_btn.clicked.connect(self.nav_calibrate)
-
-        game_btn = QPushButton("▶   JUMP GAME")
-        game_btn.setStyleSheet(
-            NAV_BTN_CSS.format(bg='#007A40', hover='#00A858')
-        )
-        game_btn.clicked.connect(self.nav_game)
-
-        rxn_btn = QPushButton("⚡   REACTION")
-        rxn_btn.setStyleSheet(
-            NAV_BTN_CSS.format(bg='#6E2E90', hover='#9040C0')
-        )
-        rxn_btn.clicked.connect(self.nav_reaction)
-
-        for btn in (cal_btn, game_btn, rxn_btn):
-            nav.addWidget(btn)
+        nav.setSpacing(12)
+        self._cal_card  = NavCard("Calibrate", "Record rest and flex, then set the threshold")
+        self._game_card = NavCard("Jump game", "Flex to jump over cacti and birds")
+        self._cal_card.clicked.connect(self.nav_calibrate)
+        self._game_card.clicked.connect(self.nav_game)
+        nav.addWidget(self._cal_card)
+        nav.addWidget(self._game_card)
         root.addLayout(nav)
 
-        # ── Footer ──────────────────────────────────────────────────────────
-        footer = _lbl(
-            "C = Calibrate   G = Jump Game   R = Reaction   "
-            "SPACE = trigger   1-8 = channel   ESC = quit",
-            10, color=C_DIM
-        )
-        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(footer)
+        self._set_pill(False)
+        self._mode_note: str = ""
+
+    def set_mode_note(self, text: str):
+        self._mode_note = text
+
+    def _set_pill(self, active: bool):
+        if active:
+            self._pill.setText("FLEX")
+            self._pill.setStyleSheet(
+                "border-radius:4px; background:#2E96D6; color:#FFFFFF; font-weight:600;")
+        else:
+            self._pill.setText("rest")
+            self._pill.setStyleSheet(
+                "border-radius:4px; background:transparent; color:#66778B; border:1px solid #C9D5E2;")
 
     def update_frame(self, activation: float, active_ch: int):
         n    = max(90, int(self._emg.sampling_rate * DISPLAY_SECS_UI))
-        disp = self._emg.peek(n)
+        disp = self._emg.peek_smooth(n)
         self._plot.update_data(disp, active_ch, self._ctrl.threshold)
         self._act_bar.set_values(activation, self._ctrl.threshold)
         self._ch_sel.set_active(active_ch)
 
         is_act = activation >= self._ctrl.threshold
-        if is_act:
-            self._pill.setText("  FLEX!  ")
-            self._pill.setStyleSheet(
-                "border-radius:12px; background:#00D26E; "
-                "color:#0B0F1A; font-weight:bold; border:none;"
-            )
-        else:
-            self._pill.setText("  rest  ")
-            self._pill.setStyleSheet(
-                "border-radius:12px; background:#1C263E; "
-                "color:#5A6A94; border:1px solid #2A3A5E;"
-            )
+        if is_act != (self._pill.text() == "FLEX"):
+            self._set_pill(is_act)
 
-        if self._cal.is_calibrated():
-            self._cal_lbl.setText(f"✓  Calibrated  ·  {self._cal.summary()}")
-            self._cal_lbl.setStyleSheet("color: #00D26E;")
+        calibrated = self._cal.is_calibrated()
+        if calibrated:
+            txt = f"Calibrated   ·   {self._cal.summary()}"
+            col = "#2FAF77"
         else:
-            self._cal_lbl.setText(
-                "⚠  Not calibrated — press Calibrate before playing"
-            )
-            self._cal_lbl.setStyleSheet("color: #5A6A94;")
+            txt = "Not calibrated — run calibration before playing"
+            col = "#66778B"
+        if self._cal_lbl.text() != txt:
+            self._cal_lbl.setText(txt)
+            self._cal_lbl.setStyleSheet(f"color: {col};")
+        self._cal_card.set_primary(not calibrated)
+        self._game_card.set_primary(calibrated)
 
         bk = self._emg.backend
-        if bk == 'synthetic':
-            self._status_lbl.setText("⬤  Synthetic")
-            self._status_lbl.setStyleSheet("color: #FFD232;")
+        if self._mode_note:
+            txt, col = f"● {self._mode_note}", "#2E96D6"
+        elif bk == 'synthetic':
+            txt, col = "● synthetic signal", "#2E96D6"
         else:
-            self._status_lbl.setText(
-                f"⬤  {self._emg.source_name[:32]}"
-            )
-            self._status_lbl.setStyleSheet("color: #00D26E;")
+            txt, col = f"● {self._emg.source_name[:34]}  {self._emg.sampling_rate} Hz", "#2FAF77"
+        if self._status_lbl.text() != txt:
+            self._status_lbl.setText(txt)
+            self._status_lbl.setStyleSheet(f"color: {col};")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -579,7 +667,6 @@ class MenuPage(QWidget):
 class CalibrationPage(QWidget):
     nav_back     = pyqtSignal()
     nav_game     = pyqtSignal()
-    nav_reaction = pyqtSignal()
     channel_changed = pyqtSignal(int)
 
     STEPS = ["Instructions", "Record REST", "Record FLEX", "Review Threshold"]
@@ -615,12 +702,11 @@ class CalibrationPage(QWidget):
 
         # ── Top bar ─────────────────────────────────────────────────────────
         top = QHBoxLayout()
-        back_btn = QPushButton("◀  Menu")
-        back_btn.setFixedWidth(90)
+        back_btn = _btn("← Menu", width=90)
         back_btn.clicked.connect(self.nav_back)
         top.addWidget(back_btn)
-        top.addSpacing(10)
-        top.addWidget(_lbl("CALIBRATION", 18, bold=True))
+        top.addSpacing(12)
+        top.addWidget(_lbl("Calibration", 19, bold=True))
         top.addStretch()
         self._step_lbl = _lbl("Step 1 / 4", 12, color=C_DIM)
         top.addWidget(self._step_lbl)
@@ -643,13 +729,13 @@ class CalibrationPage(QWidget):
 
         # ── Channel selector ─────────────────────────────────────────────────
         self._ch_sel = ChannelSelectorWidget(
-            self._emg.n_channels, DISABLED_CHANNELS
+            self._emg.n_channels, DISABLED_CHANNELS, self._emg.channel_labels
         )
         self._ch_sel.channel_changed.connect(self.channel_changed)
         root.addWidget(self._ch_sel)
 
         # ── Live EMG plot ────────────────────────────────────────────────────
-        self._plot = EMGMultiPlot(self._emg.n_channels)
+        self._plot = EMGMultiPlot(self._emg.n_channels, self._emg.channel_labels)
         self._plot.setSizePolicy(QSizePolicy.Policy.Expanding,
                                   QSizePolicy.Policy.Expanding)
         root.addWidget(self._plot, stretch=2)
@@ -682,23 +768,17 @@ class CalibrationPage(QWidget):
         v.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.setSpacing(10)
 
-        v.addWidget(_lbl("Calibration Overview", 15, bold=True,
+        v.addWidget(_lbl("How calibration works", 15, bold=True,
                          color=C_TEXT))
         for line in [
-            f"Step 1 — Relax your arm completely  ({CAL_DURATION_S}s rest recording)",
-            f"Step 2 — Flex your forearm firmly   ({CAL_DURATION_S}s flex recording)",
-            "Step 3 — Review and adjust the activation threshold",
+            f"1   Relax your arm completely for {CAL_DURATION_S} s",
+            f"2   Flex your forearm firmly for {CAL_DURATION_S} s",
+            "3   Review and adjust the activation threshold",
         ]:
             v.addWidget(_lbl(f"   {line}", 12, color=C_DIM))
 
         v.addSpacing(8)
-        start_btn = QPushButton("  START CALIBRATION  (Space)")
-        start_btn.setStyleSheet(
-            "QPushButton { background:#3A4FA0; border:none; border-radius:10px;"
-            " color:#E8ECF8; font-size:15px; font-weight:bold;"
-            " padding:14px 24px; min-height:48px; }"
-            "QPushButton:hover { background:#4D64C8; }"
-        )
+        start_btn = _btn("Start calibration", primary=True, nav=True, width=300)
         start_btn.clicked.connect(self._space_pressed)
         v.addWidget(start_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         self._step_stack.addWidget(w)
@@ -710,7 +790,7 @@ class CalibrationPage(QWidget):
         v.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.setSpacing(10)
 
-        self._step1_heading = _lbl("RELAX YOUR ARM", 20, bold=True,
+        self._step1_heading = _lbl("Relax your arm", 20, bold=True,
                                     color=C_RED)
         self._step1_heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(self._step1_heading)
@@ -728,18 +808,12 @@ class CalibrationPage(QWidget):
         self._rest_prog.setFixedHeight(28)
         v.addWidget(self._rest_prog)
 
-        self._step1_status = _lbl("Press SPACE to begin REST recording",
+        self._step1_status = _lbl("Ready — click Record rest",
                                    12, color=C_ACCENT)
         self._step1_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(self._step1_status)
 
-        start_btn = QPushButton("  Record REST  (Space)")
-        start_btn.setStyleSheet(
-            "QPushButton { background:#8B1A1A; border:none; border-radius:8px;"
-            " color:#E8ECF8; font-size:13px; font-weight:bold;"
-            " padding:10px 20px; min-height:36px; }"
-            "QPushButton:hover { background:#B02020; }"
-        )
+        start_btn = _btn("Record rest", primary=True, width=240)
         start_btn.clicked.connect(self._space_pressed)
         v.addWidget(start_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -752,7 +826,7 @@ class CalibrationPage(QWidget):
         v.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.setSpacing(10)
 
-        self._step2_heading = _lbl("FLEX YOUR ARM", 20, bold=True,
+        self._step2_heading = _lbl("Flex your arm", 20, bold=True,
                                     color=C_GREEN)
         self._step2_heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(self._step2_heading)
@@ -769,18 +843,12 @@ class CalibrationPage(QWidget):
         self._flex_prog.setFixedHeight(28)
         v.addWidget(self._flex_prog)
 
-        self._step2_status = _lbl("Press SPACE to begin FLEX recording",
+        self._step2_status = _lbl("Ready — click Record flex",
                                    12, color=C_ACCENT)
         self._step2_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(self._step2_status)
 
-        start_btn = QPushButton("  Record FLEX  (Space)")
-        start_btn.setStyleSheet(
-            "QPushButton { background:#005030; border:none; border-radius:8px;"
-            " color:#E8ECF8; font-size:13px; font-weight:bold;"
-            " padding:10px 20px; min-height:36px; }"
-            "QPushButton:hover { background:#007A40; }"
-        )
+        start_btn = _btn("Record flex", primary=True, width=240)
         start_btn.clicked.connect(self._space_pressed)
         v.addWidget(start_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -799,12 +867,12 @@ class CalibrationPage(QWidget):
         thr_row.addWidget(self._thr_val_lbl)
         thr_row.addStretch()
 
-        self._trigger_badge = _lbl("  ○ not triggered  ", 12)
+        self._trigger_badge = _lbl("not triggered", 12)
         self._trigger_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._trigger_badge.setFixedHeight(26)
+        self._trigger_badge.setFixedSize(124, 26)
         self._trigger_badge.setStyleSheet(
-            "border-radius:13px; background:#1C263E; color:#5A6A94;"
-            "border:1px solid #2A3A5E;"
+            "border-radius:13px; background:#DDE6EF; color:#66778B;"
+            "border:1px solid #C9D5E2;"
         )
         thr_row.addWidget(self._trigger_badge)
         v.addLayout(thr_row)
@@ -834,25 +902,12 @@ class CalibrationPage(QWidget):
         v.addWidget(self._quality_lbl)
 
         btn_row = QHBoxLayout()
-        redo_btn = QPushButton("↺  Redo FLEX  (Space)")
+        redo_btn = _btn("Redo flex")
         redo_btn.clicked.connect(self._space_pressed)
-        game_btn = QPushButton("▶  Jump Game (G)")
-        game_btn.setStyleSheet(
-            "QPushButton { background:#007A40; border:none; border-radius:8px;"
-            " color:#E8ECF8; font-size:13px; font-weight:bold;"
-            " padding:8px 18px; } QPushButton:hover { background:#00A858; }"
-        )
+        game_btn = _btn("Jump game", primary=True)
         game_btn.clicked.connect(self.nav_game)
-        rxn_btn = QPushButton("⚡  Reaction (R)")
-        rxn_btn.setStyleSheet(
-            "QPushButton { background:#6E2E90; border:none; border-radius:8px;"
-            " color:#E8ECF8; font-size:13px; font-weight:bold;"
-            " padding:8px 18px; } QPushButton:hover { background:#9040C0; }"
-        )
-        rxn_btn.clicked.connect(self.nav_reaction)
         btn_row.addWidget(redo_btn)
         btn_row.addWidget(game_btn)
-        btn_row.addWidget(rxn_btn)
         v.addLayout(btn_row)
 
         self._step_stack.addWidget(w)
@@ -928,11 +983,11 @@ class CalibrationPage(QWidget):
         # Step dots
         for i, d in enumerate(self._step_dots):
             if i < self.step:
-                d.setStyleSheet("color: #00D26E; font-size: 14px;")
+                d.setStyleSheet("color: #2FAF77; font-size: 14px;")
             elif i == self.step:
-                d.setStyleSheet("color: #4D9FFF; font-size: 18px;")
+                d.setStyleSheet("color: #2E96D6; font-size: 18px;")
             else:
-                d.setStyleSheet("color: #2A3A5E; font-size: 14px;")
+                d.setStyleSheet("color: #C9D5E2; font-size: 14px;")
         label = self.STEPS[min(self.step, len(self.STEPS) - 1)]
         self._step_lbl.setText(
             f"Step {min(self.step + 1, 4)} / 4  —  {label}"
@@ -944,7 +999,7 @@ class CalibrationPage(QWidget):
     def update_frame(self, activation: float, active_ch: int):
         self._frame += 1
         n    = max(90, int(self._emg.sampling_rate * DISPLAY_SECS_UI))
-        disp = self._emg.peek(n)
+        disp = self._emg.peek_smooth(n)
         self._plot.update_data(disp, active_ch, 0.0)
         self._act_bar.set_values(activation, self._ctrl.threshold)
         self._ch_sel.set_active(active_ch)
@@ -956,26 +1011,26 @@ class CalibrationPage(QWidget):
                 self._rest_prog.set_progress(self._progress)
                 secs = CAL_DURATION_S * (1 - self._progress)
                 self._step1_status.setText(
-                    f"Recording REST…  {secs:.1f}s remaining"
+                    f"Recording rest   {secs:.1f} s"
                 )
-                self._step1_status.setStyleSheet("color: #FF4848;")
+                self._step1_status.setStyleSheet("color: #E04E4E;")
             else:
                 self._rest_prog.set_progress(0.0)
-                self._step1_status.setText("Press SPACE to begin REST recording")
-                self._step1_status.setStyleSheet("color: #4D9FFF;")
+                self._step1_status.setText("Ready — click Record rest")
+                self._step1_status.setStyleSheet("color: #2E96D6;")
 
         elif self.step == 2:
             if self._recording:
                 self._flex_prog.set_progress(self._progress)
                 secs = CAL_DURATION_S * (1 - self._progress)
                 self._step2_status.setText(
-                    f"Recording FLEX…  {secs:.1f}s remaining"
+                    f"Recording flex   {secs:.1f} s"
                 )
-                self._step2_status.setStyleSheet("color: #00D26E;")
+                self._step2_status.setStyleSheet("color: #2FAF77;")
             else:
                 self._flex_prog.set_progress(0.0)
-                self._step2_status.setText("Press SPACE to begin FLEX recording")
-                self._step2_status.setStyleSheet("color: #4D9FFF;")
+                self._step2_status.setText("Ready — click Record flex")
+                self._step2_status.setStyleSheet("color: #2E96D6;")
 
         elif self.step == 3:
             thr = self._cal.threshold
@@ -986,16 +1041,16 @@ class CalibrationPage(QWidget):
 
             is_act = activation >= thr
             if is_act:
-                self._trigger_badge.setText("  ● TRIGGERED  ")
+                self._trigger_badge.setText("TRIGGERED")
                 self._trigger_badge.setStyleSheet(
-                    "border-radius:13px; background:#00D26E; color:#0B0F1A;"
+                    "border-radius:13px; background:#2FAF77; color:#FFFFFF;"
                     " font-weight:bold; border:none;"
                 )
             else:
-                self._trigger_badge.setText("  ○ not triggered  ")
+                self._trigger_badge.setText("not triggered")
                 self._trigger_badge.setStyleSheet(
-                    "border-radius:13px; background:#1C263E; color:#5A6A94;"
-                    " border:1px solid #2A3A5E;"
+                    "border-radius:13px; background:#DDE6EF; color:#66778B;"
+                    " border:1px solid #C9D5E2;"
                 )
 
             if self._cal.is_calibrated():
@@ -1011,7 +1066,7 @@ class CalibrationPage(QWidget):
                     if self._cal.quality_margin >= 8.0
                     else "Weak separation — try flexing harder"
                 )
-                qc = "#00D26E" if self._cal.quality_margin >= 8.0 else "#FFD232"
+                qc = "#2FAF77" if self._cal.quality_margin >= 8.0 else "#2E96D6"
                 self._quality_lbl.setText(quality)
                 self._quality_lbl.setStyleSheet(f"color: {qc};")
 
@@ -1062,13 +1117,21 @@ class _ProgressBar(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GameCanvas(QWidget):
-    """Renders the jump game using QPainter, scaled to widget size."""
+    """Renders the jump game with QPainter, scaled to the widget size."""
+    menu_clicked    = pyqtSignal()
+    restart_clicked = pyqtSignal()
+
+    BTN_W, BTN_H = 170, 44
 
     def __init__(self, logic: JumpGameLogic, parent=None):
         super().__init__(parent)
         self._logic      = logic
         self._activation = 0.0
         self._threshold  = 50.0
+        self._max_v      = 100.0
+        self._buttons: list[tuple[str, QRectF]] = []     # (action, rect in game coords)
+        self._hover: str = ""
+        self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
         self.setMinimumSize(400, 300)
@@ -1077,638 +1140,482 @@ class GameCanvas(QWidget):
         self._activation = activation
         self._threshold  = threshold
 
-    def paintEvent(self, event):
-        p   = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        cw  = self.width()
-        ch  = self.height()
-        sx  = cw / GAME_W
-        sy  = ch / GAME_H
-        lg  = self._logic
+    # ── mouse ──────────────────────────────────────────────────────────────
 
-        # Scale transform so all game coordinates map to canvas size
-        p.save()
-        p.scale(sx, sy)
+    def _to_game(self, pos) -> QPointF:
+        return QPointF(pos.x() * GAME_W / max(1, self.width()),
+                       pos.y() * GAME_H / max(1, self.height()))
 
-        # Background
-        p.fillRect(0, 0, GAME_W, GAME_H, C_BG)
+    def _hit(self, pos) -> str:
+        gp = self._to_game(pos)
+        for action, rect in self._buttons:
+            if rect.contains(gp):
+                return action
+        return ""
 
-        # Stars
+    def mouseMoveEvent(self, event):
+        h = self._hit(event.position())
+        if h != self._hover:
+            self._hover = h
+            self.setCursor(Qt.CursorShape.PointingHandCursor if h else Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        action = self._hit(event.position())
+        if action == "menu":
+            self.menu_clicked.emit()
+        elif action in ("restart", "start"):
+            self.restart_clicked.emit()
+
+    # ── drawing helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _font(size: int, mono: bool = False, bold: bool = False) -> QFont:
+        f = QFont(FONT_MONO if mono else FONT_UI, size)
+        f.setBold(bold)
+        return f
+
+    def _text_center(self, p: QPainter, text: str, cx: float, y: float):
+        tw = p.fontMetrics().horizontalAdvance(text)
+        p.drawText(QPointF(cx - tw / 2, y), text)
+
+    def _button(self, p: QPainter, action: str, label: str, x: float, y: float,
+                primary: bool = False):
+        rect = QRectF(x, y, self.BTN_W, self.BTN_H)
+        self._buttons.append((action, rect))
+        hovered = self._hover == action
+        path = QPainterPath()
+        path.addRoundedRect(rect, 7, 7)
+        if primary:
+            p.fillPath(path, QColor(0x4F, 0xAA, 0xE3) if hovered else C_ACCENT)
+            p.setPen(QPen(C_PANEL))
+        else:
+            p.fillPath(path, C_PANEL2 if hovered else C_PANEL)
+            p.setPen(QPen(C_DIM if hovered else C_BORDER, 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+            p.setPen(QPen(C_TEXT))
+        p.setFont(self._font(14, bold=primary))
+        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+
+    def _draw_cactus(self, p: QPainter, obs: Obstacle):
+        stems = obs.stems
+        gap   = 4
+        sw    = (obs.w - gap * (stems - 1)) / stems
         p.setPen(Qt.PenStyle.NoPen)
-        for (stx, sty, br) in lg.stars:
-            c = int(60 + br * 100)
-            p.setBrush(QBrush(QColor(c, c, min(255, int(c * 1.3)))))
-            p.drawEllipse(stx, sty, 2, 2)
+        p.setBrush(QBrush(G_OBST))
+        for k in range(stems):
+            x = obs.x + k * (sw + gap)
+            h = obs.h - (6 if (k % 2 == 1 and stems > 1) else 0)
+            y = GROUND_Y - h
+            p.drawRoundedRect(QRectF(x, y, sw, h + 2), sw * 0.35, sw * 0.35)
+            if h >= 34:
+                arm_w = max(4.0, sw * 0.45)
+                arm_h = h * 0.3
+                ay    = y + h * 0.28
+                p.drawRoundedRect(QRectF(x - arm_w - 1, ay, arm_w, arm_h), 2, 2)
+                p.drawRoundedRect(QRectF(x - arm_w - 1, ay, arm_w + 3, arm_w), 2, 2)
+                p.drawRoundedRect(QRectF(x + sw + 1, ay + 6, arm_w, arm_h), 2, 2)
+                p.drawRoundedRect(QRectF(x + sw - 2, ay + 6, arm_w + 3, arm_w), 2, 2)
 
-        # Ground
-        p.fillRect(0, GROUND_Y, GAME_W, 8,
-                   QColor(42, 160, 100))
-        p.fillRect(0, GROUND_Y + 8, GAME_W, GAME_H - GROUND_Y,
-                   QColor(28, 110, 68))
-
-        # Obstacles
-        for obs in lg.obstacles:
-            ox, oy = int(obs.x), int(obs.y)
-            p.setBrush(QBrush(C_RED))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(ox, oy, obs.w, obs.h, 5, 5)
-            p.fillRect(ox, oy, obs.w, 8, QColor(255, 140, 140))
-
-        # Player
-        pl  = lg.player
-        px  = int(pl.x)
-        py  = int(pl.y)
-        pc  = QColor(140, 210, 255) if pl.flashing else QColor(77, 159, 255)
-        p.setBrush(QBrush(pc))
+    def _draw_bird(self, p: QPainter, b: Bird):
+        x, y, w, h = b.x, b.y, b.w, b.h
+        cy = y + h * 0.6
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(px, py, pl.W, pl.H, 7, 7)
-        # Visor
-        p.fillRect(px + 4, py + 6, pl.W - 8, 16, QColor(20, 40, 80))
+        p.setBrush(QBrush(G_OBST))
+        # body + beak (flying left)
+        p.drawRoundedRect(QRectF(x + 8, cy - 6, w - 14, 12), 6, 6)
+        beak = QPainterPath()
+        beak.moveTo(x + 9, cy - 3); beak.lineTo(x, cy); beak.lineTo(x + 9, cy + 3)
+        p.fillPath(beak, G_OBST)
+        # wing: flaps between up and down
+        wing = QPainterPath()
+        wx = x + w * 0.55
+        if b.wing_up:
+            wing.moveTo(wx - 8, cy - 2); wing.lineTo(wx + 2, cy - h * 0.75); wing.lineTo(wx + 8, cy - 2)
+        else:
+            wing.moveTo(wx - 8, cy + 2); wing.lineTo(wx + 2, cy + h * 0.6); wing.lineTo(wx + 8, cy + 2)
+        wing.closeSubpath()
+        p.fillPath(wing, G_OBST)
+        # tail
+        tail = QPainterPath()
+        tail.moveTo(x + w - 7, cy - 4); tail.lineTo(x + w + 2, cy - 7); tail.lineTo(x + w - 5, cy + 2)
+        p.fillPath(tail, G_OBST)
+
+    def _draw_player(self, p: QPainter, pl: Player):
+        """A little brain with legs, facing right."""
+        x, y, w, h = pl.x, pl.y, pl.W, pl.H
+        p.setPen(Qt.PenStyle.NoPen)
+
+        # legs (run cycle on the ground, tucked in the air)
+        p.setBrush(QBrush(C_BRAIN))
+        if pl.on_ground:
+            phase = int(pl.run_phase) % 2
+            l1 = 7 if phase == 0 else 3
+            l2 = 3 if phase == 0 else 7
+            p.drawRoundedRect(QRectF(x + 8,  y + h - 10, 7, 4 + l1), 2, 2)
+            p.drawRoundedRect(QRectF(x + 20, y + h - 10, 7, 4 + l2), 2, 2)
+        else:
+            p.drawRoundedRect(QRectF(x + 8,  y + h - 10, 7, 7), 2, 2)
+            p.drawRoundedRect(QRectF(x + 20, y + h - 10, 7, 7), 2, 2)
+
+        # brain body: two lobes
+        body = QRectF(x - 3, y + 4, w + 6, h - 16)
+        p.setBrush(QBrush(C_BRAIN))
+        p.drawEllipse(body)
+        # cerebellum bump at the back-bottom
+        p.drawEllipse(QRectF(x - 2, y + h - 22, 14, 10))
+
+        # folds: midline + gyri, drawn in the background colour
+        pen = QPen(QColor(0x9A, 0x62, 0x14), 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        vpen = QPen(C_ACCENT, 1)
-        p.setPen(vpen)
-        p.drawRoundedRect(px + 4, py + 6, pl.W - 8, 16, 4, 4)
-        # Legs
+        cx = x + w / 2
+        mid = QPainterPath()
+        mid.moveTo(cx, y + 5)
+        mid.cubicTo(cx - 3, y + 14, cx + 3, y + 22, cx, y + h - 13)
+        p.drawPath(mid)
+        for (ax, ay, aw, ah, start) in [
+            (x + 1,  y + 9,  12, 8,  20),  (x + 3,  y + 18, 12, 8, 200),
+            (x + 4,  y + 26, 10, 7,  30),  (x + 19, y + 9,  12, 8,  20),
+            (x + 18, y + 18, 12, 8, 200),  (x + 20, y + 26, 10, 7,  30),
+        ]:
+            p.drawArc(QRectF(ax, ay, aw, ah), start * 16, 160 * 16)
+
+        # eye
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(50, 100, 180)))
-        p.drawRoundedRect(px + 4,  py + pl.H - 4, 10, 6, 3, 3)
-        p.drawRoundedRect(px + 20, py + pl.H - 4, 10, 6, 3, 3)
+        p.setBrush(QBrush(C_TEXT))
+        p.drawEllipse(QRectF(x + w - 9, y + 17, 6, 6))
+        p.setBrush(QBrush(C_PANEL))
+        p.drawEllipse(QRectF(x + w - 7, y + 18, 2.5, 2.5))
 
-        # Score HUD
-        f_score = QFont()
-        f_score.setPointSize(20)
-        f_score.setBold(True)
-        p.setFont(f_score)
-        p.setPen(QPen(C_TEXT, 1))
-        fm = p.fontMetrics()
-        score_str = str(lg.score)
-        sw = fm.horizontalAdvance(score_str)
-        p.drawText(GAME_W - sw - 20, 40, score_str)
+        # held-jump indicator
+        if not pl.on_ground and pl.jump_held:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(C_ACCENT, 2))
+            p.drawArc(QRectF(x + 4, y - 14, w - 8, 14), 20 * 16, 140 * 16)
 
-        f_small = QFont()
-        f_small.setPointSize(11)
-        p.setFont(f_small)
-        p.setPen(QPen(C_DIM, 1))
-        best_str = f"BEST  {lg.high_score}"
-        bw = p.fontMetrics().horizontalAdvance(best_str)
-        p.drawText(GAME_W - bw - 20, 60, best_str)
+    # ── background scenery (one drawing routine per era) ───────────────────
 
-        # Speed dots
-        spd = min(10, int(lg.speed))
-        for i in range(10):
-            dc = C_ACCENT if i < spd else C_BORDER
-            p.setBrush(QBrush(dc))
+    SIL  = QColor(0x5F, 0x7D, 0x90, 95)     # distant silhouette
+    SIL2 = QColor(0x5F, 0x7D, 0x90, 140)    # nearer / detail
+
+    def _draw_scenery(self, p: QPainter, sc: Scenery):
+        x, g = sc.x, GROUND_Y
+        p.setPen(Qt.PenStyle.NoPen)
+        era = sc.era
+        if era == 0:        # Stone age: campfire, rocks, a standing stone
+            p.setBrush(QBrush(self.SIL))
+            p.drawRoundedRect(QRectF(x + 120, g - 70, 26, 70), 8, 8)       # menhir
+            p.drawEllipse(QRectF(x - 10, g - 14, 30, 14))
+            p.drawEllipse(QRectF(x + 70, g - 10, 22, 10))
+            p.setBrush(QBrush(self.SIL2))
+            p.drawRoundedRect(QRectF(x + 22, g - 9, 40, 6), 3, 3)          # logs
+            p.drawRoundedRect(QRectF(x + 26, g - 14, 32, 6), 3, 3)
+            fl = 1.0 + 0.25 * math.sin(sc.phase * 2.3)
+            flame = QPainterPath()
+            flame.moveTo(x + 30, g - 12); flame.quadTo(x + 34, g - 24 * fl, x + 42, g - 40 * fl)
+            flame.quadTo(x + 50, g - 24 * fl, x + 54, g - 12); flame.closeSubpath()
+            p.fillPath(flame, QColor(0xF6, 0x9A, 0x4B, 220))
+            inner = QPainterPath()
+            inner.moveTo(x + 36, g - 12); inner.quadTo(x + 40, g - 20 * fl, x + 42, g - 28 * fl)
+            inner.quadTo(x + 46, g - 20 * fl, x + 48, g - 12); inner.closeSubpath()
+            p.fillPath(inner, QColor(0xFF, 0xD7, 0x6B, 230))
+        elif era == 1:      # First villages: thatched huts
+            for k, (hx, hw, hh) in enumerate([(0, 56, 34), (74, 44, 28), (132, 62, 38)]):
+                p.setBrush(QBrush(self.SIL if k != 1 else self.SIL2))
+                p.drawRect(QRectF(x + hx, g - hh, hw, hh))
+                roof = QPainterPath()
+                roof.moveTo(x + hx - 8, g - hh); roof.lineTo(x + hx + hw / 2, g - hh - hw * 0.55)
+                roof.lineTo(x + hx + hw + 8, g - hh); roof.closeSubpath()
+                p.fillPath(roof, self.SIL2)
+                p.setBrush(QBrush(QColor(0xFC, 0xE4, 0xC0, 200)))
+                p.drawRoundedRect(QRectF(x + hx + hw / 2 - 5, g - 16, 10, 16), 4, 4)   # door
+        elif era == 2:      # Ancient Egypt: pyramids
+            for (px, pw, ph, col) in [(0, 150, 110, self.SIL), (120, 100, 72, self.SIL2), (210, 60, 44, self.SIL)]:
+                tri = QPainterPath()
+                tri.moveTo(x + px, g); tri.lineTo(x + px + pw / 2, g - ph); tri.lineTo(x + px + pw, g)
+                tri.closeSubpath(); p.fillPath(tri, col)
+        elif era == 3:      # Classical Rome: temple
+            p.setBrush(QBrush(self.SIL2))
+            p.drawRect(QRectF(x, g - 12, 170, 12))                                  # steps
+            p.drawRect(QRectF(x + 6, g - 90, 158, 8))                              # architrave
+            ped = QPainterPath()
+            ped.moveTo(x - 2, g - 90); ped.lineTo(x + 85, g - 122); ped.lineTo(x + 172, g - 90); ped.closeSubpath()
+            p.fillPath(ped, self.SIL2)
+            p.setBrush(QBrush(self.SIL))
+            for k in range(6):
+                p.drawRoundedRect(QRectF(x + 14 + k * 28, g - 84, 10, 72), 3, 3)
+        elif era == 4:      # Middle ages: castle
+            p.setBrush(QBrush(self.SIL))
+            p.drawRect(QRectF(x + 20, g - 60, 150, 60))                           # wall
+            for k in range(7):
+                p.drawRect(QRectF(x + 20 + k * 22, g - 70, 12, 10))              # crenellations
+            p.setBrush(QBrush(self.SIL2))
+            for tx in (x, x + 160):
+                p.drawRect(QRectF(tx, g - 100, 30, 100))
+                cone = QPainterPath()
+                cone.moveTo(tx - 4, g - 100); cone.lineTo(tx + 15, g - 134); cone.lineTo(tx + 34, g - 100); cone.closeSubpath()
+                p.fillPath(cone, self.SIL2)
+            p.setBrush(QBrush(QColor(0xFC, 0xE4, 0xC0, 200)))
+            p.drawRoundedRect(QRectF(x + 84, g - 30, 22, 30), 11, 11)             # gate
+        elif era == 5:      # Industrial age: factory + chimneys + smoke
+            p.setBrush(QBrush(self.SIL))
+            p.drawRect(QRectF(x, g - 58, 180, 58))
+            saw = QPainterPath()
+            saw.moveTo(x, g - 58)
+            for k in range(4):
+                saw.lineTo(x + k * 45 + 30, g - 84); saw.lineTo(x + k * 45 + 45, g - 58)
+            saw.closeSubpath(); p.fillPath(saw, self.SIL)
+            p.setBrush(QBrush(self.SIL2))
+            p.drawRect(QRectF(x + 120, g - 140, 14, 82))
+            p.drawRect(QRectF(x + 150, g - 120, 12, 62))
+            p.setBrush(QBrush(QColor(255, 255, 255, 150)))
+            for k in range(3):
+                t = (sc.phase * 0.5 + k * 0.33) % 1.0
+                p.drawEllipse(QPointF(x + 127 + t * 18, g - 150 - t * 40), 8 + t * 8, 8 + t * 8)
+        elif era == 6:      # Modern city: skyline with windows
+            for k, (bx, bw, bh) in enumerate([(0, 36, 110), (42, 50, 160), (98, 30, 90), (134, 56, 200), (196, 40, 130)]):
+                p.setBrush(QBrush(self.SIL if k % 2 else self.SIL2))
+                p.drawRect(QRectF(x + bx, g - bh, bw, bh))
+                p.setBrush(QBrush(QColor(0xFC, 0xE4, 0xC0, 170)))
+                for r in range(int(bh // 22)):
+                    for c in range(int(bw // 14)):
+                        if (r + c + k) % 3:
+                            p.drawRect(QRectF(x + bx + 5 + c * 14, g - bh + 8 + r * 22, 5, 8))
+        else:               # Space age: rocket on its pad + dish
+            p.setBrush(QBrush(self.SIL))
+            p.drawRect(QRectF(x + 130, g - 150, 10, 150))                         # gantry
+            for k in range(6):
+                p.drawRect(QRectF(x + 118, g - 140 + k * 24, 22, 4))
+            p.setBrush(QBrush(self.SIL2))
+            p.drawRoundedRect(QRectF(x + 80, g - 120, 34, 120), 6, 6)             # rocket body
+            nose = QPainterPath()
+            nose.moveTo(x + 80, g - 120); nose.lineTo(x + 97, g - 156); nose.lineTo(x + 114, g - 120); nose.closeSubpath()
+            p.fillPath(nose, self.SIL2)
+            fin = QPainterPath()
+            fin.moveTo(x + 80, g - 30); fin.lineTo(x + 66, g); fin.lineTo(x + 80, g); fin.closeSubpath()
+            p.fillPath(fin, self.SIL2)
+            fin2 = QPainterPath()
+            fin2.moveTo(x + 114, g - 30); fin2.lineTo(x + 128, g); fin2.lineTo(x + 114, g); fin2.closeSubpath()
+            p.fillPath(fin2, self.SIL2)
+            p.setBrush(QBrush(self.SIL))
+            p.drawRect(QRectF(x + 10, g - 40, 6, 40))                             # dish mast
+            p.setPen(QPen(self.SIL2, 5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawArc(QRectF(x - 14, g - 70, 54, 40), 200 * 16, 140 * 16)
             p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(20 + i * 14, 18, 8, 8)
 
-        # Overlay (ready / dead)
-        if lg.state in ('ready', 'dead'):
-            ov = QColor(5, 8, 18, 170)
-            p.fillRect(0, 0, GAME_W, GAME_H, ov)
+    def _draw_era_banner(self, p: QPainter):
+        lg = self._logic
+        if lg.era_banner <= 0 or lg.state != 'playing':
+            return
+        alpha = min(1.0, lg.era_banner / 40.0)
+        col = QColor(C_TEXT); col.setAlphaF(alpha)
+        p.setPen(QPen(col))
+        p.setFont(self._font(13, mono=True))
+        self._text_center(p, f"ERA {lg.era + 1}", GAME_W / 2, 92)
+        p.setFont(self._font(22, bold=True))
+        self._text_center(p, ERAS[lg.era], GAME_W / 2, 124)
 
-            f_big = QFont()
-            f_big.setPointSize(36)
-            f_big.setBold(True)
-            p.setFont(f_big)
-            p.setPen(QPen(C_TEXT, 1))
+    def _draw_hud(self, p: QPainter):
+        lg = self._logic
+        p.setFont(self._font(15, mono=True))
+        hi  = f"HI {lg.high_score:05d}"
+        cur = f"{lg.score:05d}"
+        fm  = p.fontMetrics()
+        p.setPen(QPen(C_TEXT))
+        p.drawText(QPointF(GAME_W - 24 - fm.horizontalAdvance(cur), 36), cur)
+        p.setPen(QPen(C_DIM))
+        p.drawText(QPointF(GAME_W - 24 - fm.horizontalAdvance(cur) - 18 - fm.horizontalAdvance(hi), 36), hi)
+        if lg.state == 'playing':
+            p.setFont(self._font(11))
+            era_txt = f"era {lg.era + 1} · {ERAS[lg.era]}"
+            p.drawText(QPointF(GAME_W - 24 - p.fontMetrics().horizontalAdvance(era_txt), 56), era_txt)
 
-            if lg.state == 'ready':
-                title = "FLEX TO START"
-                body  = "Flex your forearm to begin"
+        # EMG meter, bottom-left
+        a, thr = self._activation, self._threshold
+        is_act = a >= thr
+        target = max(thr * 2.2, a * 1.1, 40.0)
+        self._max_v += (target - self._max_v) * (0.3 if target > self._max_v else 0.03)
+        max_v = self._max_v
+
+        bx, by, bw, bh = 24.0, GAME_H - 44.0, 240.0, 6.0
+        track = QPainterPath(); track.addRoundedRect(QRectF(bx, by, bw, bh), 3, 3)
+        p.fillPath(track, QColor(255, 255, 255, 170))
+        fw = bw * min(1.0, a / max_v)
+        if fw > 2:
+            fp = QPainterPath(); fp.addRoundedRect(QRectF(bx, by, fw, bh), 3, 3)
+            p.fillPath(fp, C_ACCENT if is_act else C_SIGNAL)
+        if thr > 0:
+            tx = bx + bw * min(1.0, thr / max_v)
+            p.setPen(QPen(C_ACCENT, 2))
+            p.drawLine(QPointF(tx, by - 5), QPointF(tx, by + bh + 5))
+
+        p.setFont(self._font(10, mono=True))
+        p.setPen(QPen(C_DIM))
+        p.drawText(QPointF(bx, by - 10), "EMG")
+        p.setPen(QPen(C_TEXT if is_act else C_DIM))
+        p.drawText(QPointF(bx + bw + 12, by + bh + 1), f"{a:5.1f} µV")
+
+        # top-left menu link (always clickable)
+        p.setFont(self._font(12))
+        rect = QRectF(20, 16, 90, 28)
+        self._buttons.append(("menu", rect))
+        p.setPen(QPen(C_TEXT if self._hover == "menu" else C_DIM))
+        p.drawText(rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "←  Menu")
+
+    # ── paint ──────────────────────────────────────────────────────────────
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        lg = self._logic
+        self._buttons = []
+
+        p.save()
+        p.scale(self.width() / GAME_W, self.height() / GAME_H)
+
+        # Sky: pastel sunrise gradient
+        sky = QLinearGradient(0, 0, 0, GROUND_Y)
+        for pos, col in G_SKY:
+            sky.setColorAt(pos, col)
+        p.fillRect(QRectF(0, 0, GAME_W, GROUND_Y + 2), QBrush(sky))
+
+        # Sun with a soft glow, sitting low near the horizon
+        sun_c = QPointF(GAME_W * 0.74, GROUND_Y - 78)
+        glow = QRadialGradient(sun_c, 150)
+        g0 = QColor(G_SUN_GLOW); g0.setAlpha(140)
+        g1 = QColor(G_SUN_GLOW); g1.setAlpha(0)
+        glow.setColorAt(0.0, g0); glow.setColorAt(1.0, g1)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(sun_c, 150, 150)
+        p.setBrush(QBrush(G_SUN))
+        p.drawEllipse(sun_c, 46, 46)
+
+        # Clouds (parallax)
+        p.setBrush(QBrush(G_CLOUD))
+        for cx, cy, _ in lg.clouds:
+            p.drawRoundedRect(QRectF(cx, cy, 64, 12), 6, 6)
+            p.drawRoundedRect(QRectF(cx + 14, cy - 9, 32, 14), 7, 7)
+
+        # Ground: pastel fill, horizon line, scrolling ticks
+        p.fillRect(QRectF(0, GROUND_Y, GAME_W, GAME_H - GROUND_Y), G_GROUND)
+        p.setPen(QPen(G_GROUND_LN, 2))
+        p.drawLine(QPointF(0, GROUND_Y + 1), QPointF(GAME_W, GROUND_Y + 1))
+        p.setPen(QPen(G_TICK, 2))
+        x = -lg.ground_offset
+        k = 0
+        while x < GAME_W + 48:
+            seg = 14 if k % 2 == 0 else 6
+            yy  = GROUND_Y + 16 if k % 3 == 0 else GROUND_Y + 24
+            p.drawLine(QPointF(x, yy), QPointF(x + seg, yy))
+            x += 48
+            k += 1
+
+        for sc in lg.scenery:
+            self._draw_scenery(p, sc)
+        for obs in lg.obstacles:
+            if isinstance(obs, Bird):
+                self._draw_bird(p, obs)
             else:
-                title = "GAME OVER"
-                body  = f"Score  {lg.score}   ·   Best  {lg.high_score}"
+                self._draw_cactus(p, obs)
+        self._draw_player(p, lg.player)
+        self._draw_hud(p)
+        self._draw_era_banner(p)
 
-            tw = p.fontMetrics().horizontalAdvance(title)
-            p.drawText((GAME_W - tw) // 2, GAME_H // 2 - 20, title)
-
-            f_body = QFont()
-            f_body.setPointSize(16)
-            p.setFont(f_body)
-            p.setPen(QPen(C_DIM, 1))
-            bw2 = p.fontMetrics().horizontalAdvance(body)
-            p.drawText((GAME_W - bw2) // 2, GAME_H // 2 + 30, body)
-
-            if lg.state == 'dead':
-                hint = "Flex to restart"
-                f_hint = QFont()
-                f_hint.setPointSize(13)
-                p.setFont(f_hint)
-                hw = p.fontMetrics().horizontalAdvance(hint)
-                p.drawText((GAME_W - hw) // 2, GAME_H // 2 + 60, hint)
+        if lg.state in ('ready', 'dead'):
+            p.fillRect(QRectF(0, 0, GAME_W, GAME_H), G_OVERLAY)
+            cx = GAME_W / 2
+            p.setPen(QPen(C_TEXT))
+            p.setFont(self._font(30, bold=True))
+            if lg.state == 'ready':
+                self._text_center(p, "FLEX TO START", cx, GAME_H / 2 - 30)
+                p.setFont(self._font(14))
+                p.setPen(QPen(C_DIM))
+                self._text_center(p, "quick clench → short hop      hold the clench → long jump",
+                                  cx, GAME_H / 2 + 6)
+                self._text_center(p, "low birds: jump      high birds: stay down",
+                                  cx, GAME_H / 2 + 28)
+                self._button(p, "start", "Start", cx - self.BTN_W - 8, GAME_H / 2 + 56, primary=True)
+                self._button(p, "menu",  "Main menu", cx + 8,         GAME_H / 2 + 56)
+            else:
+                self._text_center(p, "GAME OVER", cx, GAME_H / 2 - 40)
+                p.setFont(self._font(15, mono=True))
+                p.setPen(QPen(C_DIM))
+                self._text_center(p, f"score {lg.score:05d}     best {lg.high_score:05d}",
+                                  cx, GAME_H / 2 - 4)
+                self._button(p, "restart", "Play again", cx - self.BTN_W - 8, GAME_H / 2 + 28, primary=True)
+                self._button(p, "menu",    "Main menu",  cx + 8,              GAME_H / 2 + 28)
+                p.setFont(self._font(12))
+                p.setPen(QPen(C_DIM))
+                self._text_center(p, "or flex to play again", cx, GAME_H / 2 + 98)
 
         p.restore()
-
-
-class _GameSidebar(QWidget):
-    """Right-panel EMG display for the game page."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._activation = 0.0
-        self._threshold  = 50.0
-        self.setFixedWidth(160)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-
-    def set_values(self, activation: float, threshold: float):
-        self._activation = activation
-        self._threshold  = threshold
-        self.update()
-
-    def paintEvent(self, event):
-        p   = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w   = self.width()
-        h   = self.height()
-
-        # Background
-        p.fillRect(0, 0, w, h, C_PANEL)
-        p.setPen(QPen(C_BORDER, 1))
-        p.drawLine(0, 0, 0, h)
-
-        # Title
-        f_title = QFont()
-        f_title.setPointSize(11)
-        f_title.setBold(True)
-        p.setFont(f_title)
-        p.setPen(QPen(C_DIM, 1))
-        p.drawText(QRectF(0, 10, w, 24),
-                   Qt.AlignmentFlag.AlignCenter, "EMG")
-
-        # Vertical bar
-        bx = 30; bw2 = 50; by = 50; bh = 280
-        p.setBrush(QBrush(C_PANEL2))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(bx, by, bw2, bh, 6, 6)
-        p.setPen(QPen(C_BORDER, 1))
-        p.drawRoundedRect(bx, by, bw2, bh, 6, 6)
-
-        a, thr  = self._activation, self._threshold
-        max_v   = max(thr * 2.5, a * 1.2, 50.0)
-        ratio   = min(1.0, a / max_v)
-        fill_h  = int(bh * ratio)
-        fill_y  = by + bh - fill_h
-        is_act  = a >= thr
-        fill_c  = C_GREEN if is_act else C_ACCENT
-        if fill_h > 4:
-            p.setBrush(QBrush(fill_c))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(bx, fill_y, bw2, fill_h, 6, 6)
-
-        # Threshold marker
-        if thr > 0 and max_v > 0:
-            thr_ratio = min(1.0, thr / max_v)
-            ty = by + bh - int(bh * thr_ratio)
-            p.setPen(QPen(C_YELLOW, 2))
-            p.drawLine(bx - 6, ty, bx + bw2 + 6, ty)
-            f_tiny = QFont()
-            f_tiny.setPointSize(9)
-            p.setFont(f_tiny)
-            p.setPen(QPen(C_YELLOW, 1))
-            p.drawText(QRectF(0, ty - 18, w, 14),
-                       Qt.AlignmentFlag.AlignCenter, "THR")
-
-        # µV value
-        f_val = QFont()
-        f_val.setPointSize(13)
-        f_val.setBold(True)
-        p.setFont(f_val)
-        p.setPen(QPen(C_GREEN if is_act else C_TEXT, 1))
-        val_y = by + bh + 22
-        p.drawText(QRectF(0, val_y, w, 20),
-                   Qt.AlignmentFlag.AlignCenter, f"{a:.0f}")
-        f_uv = QFont()
-        f_uv.setPointSize(9)
-        p.setFont(f_uv)
-        p.setPen(QPen(C_DIM, 1))
-        p.drawText(QRectF(0, val_y + 22, w, 14),
-                   Qt.AlignmentFlag.AlignCenter, "µV")
-
-        # FLEX / rest pill
-        pill_y = val_y + 46
-        pill_h = 26
-        pill_c = C_GREEN if is_act else C_PANEL2
-        p.setBrush(QBrush(pill_c))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(10, pill_y, w - 20, pill_h, 13, 13)
-        p.setPen(QPen(C_BORDER, 1))
-        p.drawRoundedRect(10, pill_y, w - 20, pill_h, 13, 13)
-        f_pill = QFont()
-        f_pill.setPointSize(10)
-        f_pill.setBold(is_act)
-        p.setFont(f_pill)
-        p.setPen(QPen(QColor(11, 15, 26) if is_act else C_DIM, 1))
-        p.drawText(QRectF(10, pill_y, w - 20, pill_h),
-                   Qt.AlignmentFlag.AlignCenter,
-                   "FLEX!" if is_act else "rest")
-
-        # Hints
-        f_hint = QFont()
-        f_hint.setPointSize(9)
-        p.setFont(f_hint)
-        p.setPen(QPen(C_BORDER, 1))
-        p.drawText(QRectF(0, h - 42, w, 14),
-                   Qt.AlignmentFlag.AlignCenter, "C = calibrate")
-        p.drawText(QRectF(0, h - 24, w, 14),
-                   Qt.AlignmentFlag.AlignCenter, "M = menu")
         p.end()
 
 
 class GamePage(QWidget):
-    nav_back = pyqtSignal()
+    nav_back   = pyqtSignal()
+    HOLD_RATIO = 0.85     # clench counts as "held" while activation ≥ threshold × this
+    STEP       = 1.0 / 60.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.logic   = JumpGameLogic()
+        self.logic       = JumpGameLogic()
+        self._activation = 0.0
+        self._threshold  = 50.0
+        self._last_t: float | None = None
+        self._acc: float = 0.0
         self._build()
 
     def _build(self):
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
-
-        self._canvas  = GameCanvas(self.logic)
-        self._sidebar = _GameSidebar()
+        self._canvas = GameCanvas(self.logic)
+        self._canvas.menu_clicked.connect(self.nav_back)
+        self._canvas.restart_clicked.connect(self._restart)
         row.addWidget(self._canvas, stretch=1)
-        row.addWidget(self._sidebar)
+
+    def _restart(self):
+        if self.logic.state in ('dead', 'ready'):
+            self.logic.trigger_jump(0.0)     # ready/dead → playing
+
+    def reset_clock(self):
+        self._last_t = None
+        self._acc = 0.0
 
     def trigger_jump(self):
-        self.logic.trigger_jump()
+        thr = max(1.0, self._threshold)
+        strength = (self._activation - thr) / thr        # 0 at threshold, 1 at 2× threshold
+        self.logic.trigger_jump(strength)
 
-    def update_frame(self, activation: float, threshold: float):
-        self.logic.update()
-        self._sidebar.set_values(activation, threshold)
-        self._canvas.update()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Page: Reaction Challenge  (QPainter canvas)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _reaction_tier(ms: float) -> tuple[str, QColor]:
-    """Return (label, color) performance tier for a reaction time in ms."""
-    if ms < 180:  return ("⚡ LIGHTNING",  QColor(255, 220,  50))
-    if ms < 250:  return ("🔥 EXCELLENT",  QColor(  0, 210, 110))
-    if ms < 350:  return ("✓  GOOD",        QColor( 77, 159, 255))
-    if ms < 500:  return ("○  AVERAGE",     QColor(180, 180, 180))
-    return            ("△  SLOW",          QColor(160, 100, 100))
-
-
-class _ReactionCanvas(QWidget):
-    """Draws all reaction-challenge states via QPainter."""
-
-    def __init__(self, logic: ReactionLogic, parent=None):
-        super().__init__(parent)
-        self.logic       = logic
-        self._activation = 0.0
-        self._threshold  = 50.0
-        self._frame      = 0
-        self.setSizePolicy(QSizePolicy.Policy.Expanding,
-                           QSizePolicy.Policy.Expanding)
-
-    def set_emg(self, activation: float, threshold: float):
+    def update_frame(self, activation: float, threshold: float, held: bool | None = None):
         self._activation = activation
         self._threshold  = threshold
+        if held is None:
+            held = activation >= threshold * self.HOLD_RATIO
 
-    def paintEvent(self, _):
-        self._frame += 1
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-
-        w, h = self.width(), self.height()
-        state = self.logic.state
-
-        if state == 'go':
-            # Pulsing green background
-            pulse = 0.5 + 0.5 * abs((self._frame % 20) / 10.0 - 1.0)
-            g = int(20 + pulse * 30)
-            p.fillRect(0, 0, w, h, QColor(0, g, 0))
-        else:
-            p.fillRect(0, 0, w, h, C_BG)
-
-        cx, cy = w // 2, h // 2
-
-        if state == 'waiting':
-            self._draw_waiting(p, cx, cy, w, h)
-        elif state == 'go':
-            self._draw_go(p, cx, cy, w, h)
-        elif state == 'result':
-            self._draw_result(p, cx, cy, w, h)
-        elif state == 'leaderboard':
-            self._draw_leaderboard(p, cx, cy, w, h)
-
-        self._draw_emg_strip(p, w, h)
-        p.end()
-
-    # ── State drawers ─────────────────────────────────────────────────────────
-
-    def _draw_waiting(self, p: QPainter, cx, cy, w, h):
-        # Countdown ring showing fraction of wait time remaining
-        t_left  = self.logic.time_until_go
-        t_total = self.logic.wait_total
-        frac    = 1.0 - (t_left / t_total if t_total > 0 else 0)
-
-        ring_r = min(w, h) // 5
-        ring_x = cx - ring_r
-        ring_y = cy - ring_r - h // 8
-        ring_sz = ring_r * 2
-
-        # Track ring
-        p.setPen(QPen(C_PANEL2, 10, Qt.PenStyle.SolidLine,
-                      Qt.PenCapStyle.RoundCap))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(ring_x, ring_y, ring_sz, ring_sz)
-
-        # Progress arc (red → yellow as GO approaches)
-        if frac > 0:
-            r = int(255)
-            g = int(min(210, frac * 210))
-            arc_color = QColor(r, g, 0)
-            pen = QPen(arc_color, 10, Qt.PenStyle.SolidLine,
-                       Qt.PenCapStyle.RoundCap)
-            p.setPen(pen)
-            span = int(frac * 360 * 16)
-            p.drawArc(ring_x, ring_y, ring_sz, ring_sz, 90 * 16, -span)
-
-        # Seconds inside ring
-        self._text(p, f"{t_left:.1f}s", cx, cy - h // 8,
-                   QColor(232, 236, 248), 22, bold=True)
-
-        # Heading
-        self._text(p, "GET READY", cx, cy + ring_r + 20 - h // 8,
-                   C_RED, 34, bold=True)
-
-        # Animated dots
-        dots = "·" * (1 + (self._frame // 18) % 3)
-        self._text(p, f"Wait for it {dots}", cx, cy + ring_r + 60 - h // 8,
-                   C_DIM, 16)
-
-        # Participant name
-        self._text(p, f"Participant: {self.logic.current_name}",
-                   cx, cy + ring_r + 90 - h // 8, C_DIM, 13)
-
-    def _draw_go(self, p: QPainter, cx, cy, w, h):
-        # Pulsing scale for GO text
-        pulse = 0.92 + 0.08 * abs((self._frame % 14) / 7.0 - 1.0)
-        size  = int(90 * pulse)
-
-        # Outer glow rings
-        for r_off, alpha in [(60, 30), (40, 60), (20, 100)]:
-            glow = QColor(0, 210, 110, alpha)
-            p.setPen(QPen(glow, 4))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(cx - r_off, cy - r_off - 40, r_off * 2, r_off * 2)
-
-        self._text(p, "GO!", cx, cy - 40, C_GREEN, size, bold=True)
-        self._text(p, "FLEX NOW!", cx, cy + 55, QColor(180, 255, 180), 26)
-        self._text(p, self.logic.current_name, cx, cy + 95, C_DIM, 14)
-
-    def _draw_result(self, p: QPainter, cx, cy, w, h):
-        if self.logic.false_start:
-            self._text(p, "FALSE START!", cx, cy - 60, C_RED, 42, bold=True)
-            self._text(p, "You flexed before GO!", cx, cy, C_DIM, 18)
-            self._text(p, "Press N to try again", cx, cy + 40, C_DIM, 14)
-            return
-
-        ms = self.logic.result_ms
-        tier_label, tier_color = _reaction_tier(ms)
-
-        # Tier badge background
-        badge_w, badge_h = 260, 44
-        bx, by = cx - badge_w // 2, cy - 130
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(bx, by, badge_w, badge_h), 22, 22)
-        badge_bg = QColor(tier_color)
-        badge_bg.setAlpha(40)
-        p.fillPath(path, badge_bg)
-        p.setPen(QPen(tier_color, 2))
-        p.drawPath(path)
-        self._text(p, tier_label, cx, by + badge_h // 2, tier_color, 16, bold=True)
-
-        # Name
-        self._text(p, self.logic.current_name, cx, cy - 60, C_TEXT, 20, bold=True)
-
-        # Big time
-        self._text(p, f"{ms:.0f}", cx, cy + 20, tier_color, 72, bold=True)
-        self._text(p, "ms", cx, cy + 70, C_DIM, 20)
-
-        # Rank
-        rank = self.logic.get_rank_label()
-        rank_color = C_GOLD if rank == "NEW RECORD!" else C_DIM
-        self._text(p, rank, cx, cy + 100, rank_color, 18, bold=(rank == "NEW RECORD!"))
-
-        # Action hint
-        self._text(p, "L = Leaderboard   ·   N = Next participant",
-                   cx, h - 60, C_DIM, 12)
-
-    def _draw_leaderboard(self, p: QPainter, cx, cy, w, h):
-        # Header
-        self._text(p, "LEADERBOARD", cx, 50, C_GOLD, 28, bold=True)
-
-        lb = self.logic.leaderboard
-        if not lb:
-            self._text(p, "No scores yet", cx, cy, C_DIM, 16)
-            self._text(p, "N = Add participant", cx, h - 60, C_DIM, 12)
-            return
-
-        # Time bars — scale to best time
-        best_ms = lb[0][1] if lb else 1.0
-        bar_max_w = min(w * 0.45, 400)
-        row_h = min(48, (h - 160) // max(len(lb[:8]), 1))
-        start_y = 90
-
-        medals = ["🥇", "🥈", "🥉"]
-        colors = [C_GOLD, C_SILVER, C_BRONZE]
-
-        for i, (name, ms) in enumerate(lb[:8]):
-            ry = start_y + i * row_h
-            color = colors[i] if i < 3 else C_TEXT
-            prefix = medals[i] if i < 3 else f"#{i+1}"
-
-            # Bar (relative to best)
-            ratio = best_ms / ms if ms > 0 else 1.0
-            bar_w = int(bar_max_w * ratio)
-            bar_x = cx - int(bar_max_w) - 10
-            bar_y = ry + row_h // 2 - 10
-
-            bar_bg = QColor(color)
-            bar_bg.setAlpha(20)
-            p.fillRect(bar_x, bar_y, int(bar_max_w), 20, bar_bg)
-            bar_fill = QColor(color)
-            bar_fill.setAlpha(120)
-            p.fillRect(bar_x, bar_y, bar_w, 20, bar_fill)
-
-            # Rank + name
-            p.setPen(QPen(color))
-            f = QFont("Arial", 14 if i < 3 else 13)
-            if i < 3:
-                f.setBold(True)
-            p.setFont(f)
-            p.drawText(QRectF(cx - int(bar_max_w) - 10, ry, bar_max_w, row_h),
-                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                       f"  {prefix}  {name}")
-
-            # Time
-            f2 = QFont("Arial", 13, QFont.Weight.Bold if i == 0 else QFont.Weight.Normal)
-            p.setFont(f2)
-            p.drawText(QRectF(cx + 14, ry, 120, row_h),
-                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                       f"{ms:.0f} ms")
-
-        self._text(p, "N = Add next participant", cx, h - 40, C_DIM, 12)
-
-    def _draw_emg_strip(self, p: QPainter, w, h):
-        a, thr = self._activation, self._threshold
-        bx, by, bw, bh = 16.0, h - 30.0, 220.0, 14.0
-
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(C_PANEL2))
-        p.drawRoundedRect(QRectF(bx, by, bw, bh), bh / 2, bh / 2)
-
-        max_v = max(thr * 2.5, a * 1.1, 50.0)
-        fw    = bw * min(1.0, a / max_v) if max_v > 0 else 0
-        color = C_GREEN if a >= thr else C_ACCENT
-        if fw > 2:
-            p.setBrush(QBrush(color))
-            p.drawRoundedRect(QRectF(bx, by, fw, bh), bh / 2, bh / 2)
-
-        if thr > 0 and max_v > 0:
-            tx = bx + bw * min(1.0, thr / max_v)
-            p.setPen(QPen(C_YELLOW, 2))
-            p.drawLine(QPointF(tx, by - 4), QPointF(tx, by + bh + 4))
-
-        p.setPen(QPen(C_BORDER, 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(QRectF(bx, by, bw, bh), bh / 2, bh / 2)
-
-        p.setPen(QPen(C_DIM))
-        f = QFont("Arial", 9)
-        p.setFont(f)
-        p.drawText(QRectF(bx, by - 18, 180, 14),
-                   Qt.AlignmentFlag.AlignLeft, f"EMG  {a:.0f} µV")
-
-    @staticmethod
-    def _text(p: QPainter, text: str, cx, cy, color: QColor,
-              size: int, bold=False):
-        p.setPen(QPen(color))
-        f = QFont("Arial", size)
-        if bold:
-            f.setBold(True)
-        p.setFont(f)
-        fm = p.fontMetrics()
-        tw = fm.horizontalAdvance(text)
-        th = fm.height()
-        p.drawText(cx - tw // 2, cy + th // 3, text)
-
-
-class ReactionPage(QWidget):
-    nav_back = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.logic  = ReactionLogic()
-        self._frame = 0
-        self._build()
-
-    def _build(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        # ── Top bar ──────────────────────────────────────────────────────────
-        top = QHBoxLayout()
-        top.setContentsMargins(16, 10, 16, 0)
-        back_btn = QPushButton("◀  Menu")
-        back_btn.setFixedWidth(90)
-        back_btn.clicked.connect(self.nav_back)
-        top.addWidget(back_btn)
-        top.addStretch()
-        hint = _lbl("F11 = fullscreen   M = menu", 10, color=C_DIM)
-        top.addWidget(hint)
-        root.addLayout(top)
-
-        # ── Name-entry form (only shown in enter_name state) ─────────────────
-        self._name_card = QWidget()
-        nc = QVBoxLayout(self._name_card)
-        nc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        nc.setSpacing(14)
-        nc.setContentsMargins(0, 0, 0, 0)
-
-        nc.addWidget(_lbl("⚡  Reaction Challenge", 28, bold=True, color=C_TEXT),
-                     alignment=Qt.AlignmentFlag.AlignCenter)
-        nc.addWidget(_lbl("Flex your forearm as fast as possible when GO appears!",
-                           13, color=C_DIM),
-                     alignment=Qt.AlignmentFlag.AlignCenter)
-        nc.addSpacing(12)
-
-        name_row = QHBoxLayout()
-        name_row.setSpacing(8)
-        self._name_input = QLineEdit()
-        self._name_input.setPlaceholderText("Enter your name…")
-        self._name_input.setMaxLength(14)
-        self._name_input.setFixedSize(300, 48)
-        self._name_input.returnPressed.connect(self._submit_name)
-        go_btn = QPushButton("Go →")
-        go_btn.setFixedSize(72, 48)
-        go_btn.setStyleSheet(
-            "QPushButton { background:#4D9FFF; border:none; border-radius:8px;"
-            " color:#0B0F1A; font-size:15px; font-weight:bold; }"
-            "QPushButton:hover { background:#77BFFF; }"
-        )
-        go_btn.clicked.connect(self._submit_name)
-        name_row.addStretch()
-        name_row.addWidget(self._name_input)
-        name_row.addWidget(go_btn)
-        name_row.addStretch()
-        nc.addLayout(name_row)
-
-        nc.addWidget(_lbl("Tip: false-starting before GO resets your attempt!",
-                           11, color=C_DIM),
-                     alignment=Qt.AlignmentFlag.AlignCenter)
-
-        root.addWidget(self._name_card, stretch=1)
-
-        # ── Canvas (waiting / go / result / leaderboard) ─────────────────────
-        self._canvas = _ReactionCanvas(self.logic)
-        root.addWidget(self._canvas, stretch=1)
-
-        self._name_card.hide()  # canvas visible by default; toggled in update
-
-    def _submit_name(self):
-        text = self._name_input.text().strip()
-        if text:
-            self.logic.name_input = text
-            self.logic.submit_name()
-            self._name_input.clear()
-
-    def handle_key(self, key: int, text: str):
-        state = self.logic.state
-        if state == 'result':
-            if key == Qt.Key.Key_L:
-                self.logic.next_participant()
-            elif key == Qt.Key.Key_N:
-                self.logic.new_participant()
-        elif state == 'leaderboard':
-            if key == Qt.Key.Key_N:
-                self.logic.new_participant()
-
-    def update_frame(self, activation: float, threshold: float,
-                     triggered: bool):
-        self._frame += 1
-        self.logic.update()
-        if triggered:
-            self.logic.trigger_flex()
+        # Fixed-step simulation driven by wall-clock time, so the game runs at the
+        # same speed whether the UI manages 60 fps or 30 fps.
+        now = time.monotonic()
+        if self._last_t is None:
+            self._last_t = now
+        self._acc += min(0.25, now - self._last_t)
+        self._last_t = now
+        steps = 0
+        while self._acc >= self.STEP and steps < 4:
+            self.logic.update(held)
+            self._acc -= self.STEP
+            steps += 1
 
         self._canvas.set_emg(activation, threshold)
-
-        # Show name-entry card OR the canvas
-        in_name = (self.logic.state == 'enter_name')
-        self._name_card.setVisible(in_name)
-        self._canvas.setVisible(not in_name)
-
-        if not in_name:
-            self._canvas.update()
+        self._canvas.update()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1717,9 +1624,12 @@ class ReactionPage(QWidget):
 
 class EMGWorkshopWindow(QMainWindow):
 
+    KEYBOARD_FLEX_UV = 120.0     # activation reported while SPACE is held in keyboard mode
+    KEYBOARD_REST_UV = 4.0
+
     def __init__(self, emg: EMGInput, proc: EMGProcessor,
                  cal: Calibration, ctrl: TriggerController,
-                 default_ch: int):
+                 default_ch: int, keyboard_mode: bool = False):
         super().__init__()
         self._emg        = emg
         self._proc       = proc
@@ -1727,42 +1637,42 @@ class EMGWorkshopWindow(QMainWindow):
         self._ctrl       = ctrl
         self._active_ch  = default_ch
         self._manual_trig = False
+        self._keyboard_mode = keyboard_mode
+        self._space_down = False
 
         self.setWindowTitle("EMG BCI Workshop — Triton Neurotech")
         self.setMinimumSize(800, 560)
         self.resize(WIN_W, WIN_H)
-        self.setStyleSheet(STYLESHEET)
+        self.setStyleSheet(build_stylesheet())
 
         # Pages
         self._stack = QStackedWidget()
         self.setCentralWidget(self._stack)
 
         self._menu_page = MenuPage(emg, ctrl, cal)
+        if keyboard_mode:
+            self._menu_page.set_mode_note("keyboard test mode — hold SPACE to flex")
         self._cal_page  = CalibrationPage(emg, proc, cal, ctrl)
         self._game_page = GamePage()
-        self._rxn_page  = ReactionPage()
 
         self._stack.addWidget(self._menu_page)   # 0
         self._stack.addWidget(self._cal_page)    # 1
         self._stack.addWidget(self._game_page)   # 2
-        self._stack.addWidget(self._rxn_page)    # 3
 
         # Wire navigation signals
         self._menu_page.nav_calibrate.connect(self._goto_cal)
         self._menu_page.nav_game.connect(self._goto_game)
-        self._menu_page.nav_reaction.connect(self._goto_rxn)
         self._menu_page.channel_changed.connect(self._set_channel)
 
         self._cal_page.nav_back.connect(self._goto_menu)
         self._cal_page.nav_game.connect(self._goto_game)
-        self._cal_page.nav_reaction.connect(self._goto_rxn)
         self._cal_page.channel_changed.connect(self._set_channel)
 
         self._game_page.nav_back.connect(self._goto_menu)
-        self._rxn_page.nav_back.connect(self._goto_menu)
 
-        # Update timer
+        # Update timer (precise: the default coarse timer drifts to ~30 fps)
         self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.setInterval(TICK_MS)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
@@ -1781,10 +1691,8 @@ class EMGWorkshopWindow(QMainWindow):
         self._stack.setCurrentIndex(1)
 
     def _goto_game(self):
+        self._game_page.reset_clock()
         self._stack.setCurrentIndex(2)
-
-    def _goto_rxn(self):
-        self._stack.setCurrentIndex(3)
 
     def _set_channel(self, ch: int):
         self._active_ch = ch
@@ -1801,6 +1709,11 @@ class EMGWorkshopWindow(QMainWindow):
         activation = EMGProcessor.compute_activation_from_window(
             _disp, self._active_ch, self._proc.smooth_samples
         )
+        if self._keyboard_mode:
+            # SPACE replaces the muscle: a held key is a held clench, with a little
+            # noise so the envelope/plot code sees something realistic.
+            base = self.KEYBOARD_FLEX_UV if self._space_down else self.KEYBOARD_REST_UV
+            activation = base + float(np.random.randn()) * base * 0.08
 
         triggered         = self._ctrl.update(activation) or self._manual_trig
         self._manual_trig = False
@@ -1815,10 +1728,8 @@ class EMGWorkshopWindow(QMainWindow):
         elif idx == 2:
             if triggered:
                 self._game_page.trigger_jump()
-            self._game_page.update_frame(activation, self._ctrl.threshold)
-        elif idx == 3:
-            self._rxn_page.update_frame(activation, self._ctrl.threshold,
-                                         triggered)
+            self._game_page.update_frame(activation, self._ctrl.threshold,
+                                         held=self._ctrl.is_held(GamePage.HOLD_RATIO))
 
     # ── Keyboard ───────────────────────────────────────────────────────────────
 
@@ -1842,21 +1753,25 @@ class EMGWorkshopWindow(QMainWindow):
             self._goto_cal()
         elif k == Qt.Key.Key_G:
             self._goto_game()
-        elif k == Qt.Key.Key_R:
-            self._goto_rxn()
         elif Qt.Key.Key_1 <= k <= Qt.Key.Key_8:
             ch = k - Qt.Key.Key_1
             if ch < self._emg.n_channels and ch not in DISABLED_CHANNELS:
                 self._set_channel(ch)
         elif k == Qt.Key.Key_Space:
-            if idx == 1:
+            if self._keyboard_mode:
+                if not event.isAutoRepeat():
+                    self._space_down = True
+            elif idx == 1:
                 self._cal_page.handle_space()
             else:
                 self._manual_trig = True
-        elif idx == 3:
-            self._rxn_page.handle_key(k, event.text())
 
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_down = False
+        super().keyReleaseEvent(event)
 
     def closeEvent(self, event):
         self._timer.stop()
@@ -1868,15 +1783,67 @@ class EMGWorkshopWindow(QMainWindow):
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("EMG BCI Workshop")
+def parse_args(argv):
+    ap = argparse.ArgumentParser(description="EMG BCI Workshop")
+    ap.add_argument("--backend", default="auto",
+                    choices=["auto", "lsl", "udp", "sdk", "ganglion", "synthetic"],
+                    help="EMG source (default: auto = lsl → udp → sdk → synthetic)")
+    ap.add_argument("--synthetic", action="store_true", help="shortcut for --backend synthetic")
+    ap.add_argument("--keyboard", action="store_true",
+                    help="test mode: no EMG, hold SPACE to flex (drives the same trigger/game logic)")
+    ap.add_argument("--ganglion", action="store_true",
+                    help="shortcut for --backend ganglion (direct BLE via BrainFlow)")
+    ap.add_argument("--mac", default="", help="Ganglion BLE MAC/UUID (optional)")
+    ap.add_argument("--serial", default="", help="Ganglion BLE name, e.g. Ganglion-1234 (optional)")
+    ap.add_argument("--serial-port", default="",
+                    help="BLED112 dongle port, e.g. /dev/cu.usbmodem11 (uses non-native Ganglion driver)")
+    ap.add_argument("--timeout", type=int, default=15, help="Ganglion BLE connect timeout (s)")
+    ap.add_argument("--udp-host", default="127.0.0.1", help="OpenBCI GUI UDP host")
+    ap.add_argument("--udp-port", type=int, default=12345, help="OpenBCI GUI UDP port")
+    ap.add_argument("--channels", default="",
+                    help="only show these channels, 1-based, e.g. --channels 1 or --channels 1,3")
+    # Qt may receive the remaining args
+    return ap.parse_known_args(argv)
 
-    emg = EMGInput()
+
+def main():
+    args, qt_argv = parse_args(sys.argv[1:])
+    app = QApplication([sys.argv[0]] + qt_argv)
+    app.setApplicationName("EMG BCI Workshop")
+    load_fonts()
+    app.setFont(QFont(FONT_UI, 13))
+
+    backend = args.backend
+    if args.synthetic or args.keyboard:
+        backend = "synthetic"
+    elif args.ganglion:
+        backend = "ganglion"
+
+    emg = EMGInput(
+        synthetic=(backend == "synthetic"),
+        quiet=args.keyboard,
+        preferred_backend=backend,
+        udp_host=args.udp_host, udp_port=args.udp_port,
+        ganglion_mac=args.mac, ganglion_serial=args.serial,
+        ganglion_serial_port=args.serial_port, ganglion_timeout=args.timeout,
+    )
     emg.start()
 
+    if args.channels:
+        wanted = [int(c) - 1 for c in args.channels.replace(" ", "").split(",") if c]
+        emg.select_channels(wanted)
+
     channel_metrics = probe_channel_metrics(emg)
-    default_ch      = choose_default_channel(channel_metrics, emg.n_channels)
+    if not args.channels:
+        # Drop channels that carry nothing at all (switched off in the OpenBCI
+        # GUI, or padding channels in an LSL stream) so the UI only shows real inputs.
+        flat = [i for i, (m, p95) in enumerate(channel_metrics) if p95 < 0.25 and m < 0.15]
+        if flat and len(flat) < emg.n_channels:
+            keep = [i for i in range(emg.n_channels) if i not in flat]
+            print(f"[main] Hiding flat channels: {', '.join(emg.channel_labels[i] for i in flat)}")
+            emg.select_channels(keep)
+            channel_metrics = [channel_metrics[i] for i in keep]
+    default_ch = choose_default_channel(channel_metrics, emg.n_channels)
 
     proc = EMGProcessor(
         sampling_rate=emg.sampling_rate, smooth_ms=90, channel=default_ch
@@ -1888,7 +1855,8 @@ def main():
 
     print("=" * 54)
     print("  EMG BCI Workshop  |  Triton Neurotech")
-    print(f"  Backend: {emg.backend}  |  {emg.n_channels} ch @ {emg.sampling_rate} Hz")
+    print(f"  Backend: {emg.backend}  |  {emg.n_channels} ch @ {emg.sampling_rate} Hz"
+          f"  ({', '.join(emg.channel_labels)})")
     metrics_str = "  ".join(
         f"CH{i+1}:{m:.1f}/{p:.1f}"
         for i, (m, p) in enumerate(channel_metrics)
@@ -1897,7 +1865,8 @@ def main():
     print(f"  Default channel: CH{default_ch + 1}")
     print("=" * 54)
 
-    win = EMGWorkshopWindow(emg, proc, cal, ctrl, default_ch)
+    win = EMGWorkshopWindow(emg, proc, cal, ctrl, default_ch,
+                            keyboard_mode=args.keyboard)
     win.show()
 
     sys.exit(app.exec())
