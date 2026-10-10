@@ -28,7 +28,7 @@ import socket
 import time
 import threading
 import numpy as np
-from scipy.signal import lfilter, lfilter_zi
+from scipy.signal import lfilter, lfilter_zi, butter, iirnotch
 
 DISPLAY_SECS = 5      # seconds of history in the display ring buffer
 MAX_CHANNELS  = 8     # hard cap — UI supports up to 8 channels
@@ -56,7 +56,13 @@ except ImportError:
 UDP_DEFAULT_HOST = "127.0.0.1"
 UDP_DEFAULT_PORT = 12345          # OpenBCI GUI Networking widget default
 KNOWN_RATES      = (125, 200, 250, 500, 1000, 1600)
-DC_HIGHPASS_HZ   = 5.0            # removes Ganglion electrode offset / drift
+# Front-end filter for raw OpenBCI sources (MindRove Connect already filters).
+# 20 Hz high-pass: removes electrode offset, drift AND motion artefacts, which on
+# plain gel electrodes are several times larger than the EMG itself and were
+# triggering jumps on hand movement rather than on muscle activity.
+# 60 Hz notch: mains hum was ~15% of the signal power at rest.
+EMG_HIGHPASS_HZ  = 20.0
+MAINS_HZ         = 60.0
 
 
 class EMGInput:
@@ -89,6 +95,7 @@ class EMGInput:
         self._disp_buf: np.ndarray | None = None
         self._disp_lock = threading.Lock()
         self._n_total: int = 0                 # samples ever appended
+        self.last_sample_time: float = 0.0     # monotonic time of the last chunk
         self._clock_offset: float | None = None  # wall time of "sample 0", low-pass filtered
 
         self._pending_buf: np.ndarray | None = None
@@ -101,10 +108,10 @@ class EMGInput:
         # UDP state (OpenBCI GUI JSON)
         self._udp_sock: socket.socket | None = None
 
-        # Optional per-channel DC-removal high-pass (used for OpenBCI sources,
-        # whose raw samples carry a large electrode offset). None = disabled.
-        self._hp_ba: tuple[np.ndarray, np.ndarray] | None = None
-        self._hp_zi: np.ndarray | None = None
+        # Optional per-channel front-end filters for raw OpenBCI sources:
+        # a cascade of (b, a) sections with per-channel state. None = disabled.
+        self._hp_ba: list[tuple[np.ndarray, np.ndarray]] | None = None
+        self._hp_zi: list[np.ndarray] | None = None
 
         # Synthetic state
         self._synth_t = 0.0
@@ -236,6 +243,21 @@ class EMGInput:
     def n_channels(self) -> int:
         return len(self.emg_channels)
 
+    def is_alive(self, max_silence_s: float = 2.0) -> bool:
+        """True if samples arrived recently (synthetic always counts as alive)."""
+        if self.backend == "synthetic":
+            return True
+        return (time.monotonic() - self.last_sample_time) < max_silence_s
+
+    def _wait_for_data(self, timeout_s: float) -> bool:
+        """Block until the first chunk arrives, or give up."""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout_s:
+            if self._n_total > 0:
+                return True
+            time.sleep(0.05)
+        return False
+
     def select_channels(self, logical: list[int]):
         """
         Keep only the given channels (indices into the current channel list).
@@ -252,7 +274,8 @@ class EMGInput:
                 self._disp_buf = np.ascontiguousarray(self._disp_buf[logical, :])
             self._pending_buf = np.zeros((len(logical), 0))
             if self._hp_zi is not None:
-                self._hp_zi = np.ascontiguousarray(self._hp_zi[logical, :])
+                self._hp_zi = [None if z is None else np.ascontiguousarray(z[logical, :])
+                               for z in self._hp_zi]
         print(f"[EMGInput] Showing channels: {', '.join(self.channel_labels)}")
 
     # ── Backend setup ───────────────────────────────────────────────────────────
@@ -293,6 +316,13 @@ class EMGInput:
             self._acq_thread = threading.Thread(target=self._lsl_loop, daemon=True)
             self._acq_thread.start()
 
+            if not self._wait_for_data(3.0):
+                print(f"[EMGInput] LSL stream '{stream.name()}' found but it is not sending "
+                      "samples (is the data stream started in the source app?) — skipping.")
+                self._running = False
+                self._acq_thread.join(timeout=0.5)
+                self._lsl_inlet = None
+                return False
             # Let a short buffer fill, then report which channels have signal.
             time.sleep(0.3)
             self.pull()   # drain stale startup data
@@ -326,6 +356,14 @@ class EMGInput:
             self._acq_thread = threading.Thread(target=self._sdk_loop, daemon=True)
             self._acq_thread.start()
 
+            if not self._wait_for_data(2.5):
+                # prepare_session() succeeds with no armband on the network — treat
+                # "no samples" as not connected so we fall through to the next backend.
+                print("[EMGInput] MindRove SDK session opened but no data arrived "
+                      "(armband not on this Wi-Fi?) — skipping.")
+                self._running = False
+                self._acq_thread.join(timeout=0.5)
+                raise RuntimeError("no data from MindRove SDK")
             time.sleep(0.3)
             self.pull()
             self._print_channel_report()
@@ -378,7 +416,12 @@ class EMGInput:
             self._acq_thread = threading.Thread(target=self._sdk_loop, daemon=True)
             self._acq_thread.start()
 
-            time.sleep(1.0)
+            if not self._wait_for_data(4.0):
+                print("[EMGInput] Ganglion connected but no samples arrived — skipping.")
+                self._running = False
+                self._acq_thread.join(timeout=0.5)
+                raise RuntimeError("no data from Ganglion")
+            time.sleep(0.5)
             self.pull()
             self._print_channel_report()
             return True
@@ -510,11 +553,16 @@ class EMGInput:
                 self._append_chunk(arr[valid, :])
 
     def _enable_dc_highpass(self):
-        """First-order high-pass (DC_HIGHPASS_HZ) applied per channel in _append_chunk."""
-        a = float(np.exp(-2.0 * np.pi * DC_HIGHPASS_HZ / max(1, self.sampling_rate)))
-        b = np.array([a, -a])
-        aa = np.array([1.0, -a])
-        self._hp_ba = (b, aa)
+        """20 Hz 2nd-order high-pass + 60 Hz notch, applied per channel in _append_chunk."""
+        sr = max(1, self.sampling_rate)
+        sections = []
+        if EMG_HIGHPASS_HZ < sr / 2:
+            b, a = butter(2, EMG_HIGHPASS_HZ / (sr / 2), btype="high")
+            sections.append((b, a))
+        if MAINS_HZ < sr / 2:
+            b, a = iirnotch(MAINS_HZ, 30.0, sr)
+            sections.append((b, a))
+        self._hp_ba = sections or None
         self._hp_zi = None      # seeded from the first chunk
 
     def _print_channel_report(self):
@@ -562,13 +610,14 @@ class EMGInput:
             return
 
         if self._hp_ba is not None:
-            b, a = self._hp_ba
-            if self._hp_zi is None or self._hp_zi.shape[0] != new_data.shape[0]:
-                # Seed so the filter starts at steady state for the current offset
-                # (no multi-second settling transient).
-                zi0 = lfilter_zi(b, a)                       # shape (1,)
-                self._hp_zi = np.outer(new_data[:, 0], zi0)   # (n_ch, 1)
-            new_data, self._hp_zi = lfilter(b, a, new_data, axis=1, zi=self._hp_zi)
+            if self._hp_zi is None or self._hp_zi[0].shape[0] != new_data.shape[0]:
+                self._hp_zi = [None] * len(self._hp_ba)
+            for k, (b, a) in enumerate(self._hp_ba):
+                if self._hp_zi[k] is None:
+                    # Seed each section at steady state for ITS OWN first input sample
+                    # (after the preceding sections), so there is no settling transient.
+                    self._hp_zi[k] = np.outer(new_data[:, 0], lfilter_zi(b, a))
+                new_data, self._hp_zi[k] = lfilter(b, a, new_data, axis=1, zi=self._hp_zi[k])
 
         n = new_data.shape[1]
         with self._pending_lock:
@@ -590,6 +639,7 @@ class EMGInput:
             # samples in the future and stall the display).
             self._n_total += n
             now = time.monotonic()
+            self.last_sample_time = now
             est = now - self._n_total / max(1, self.sampling_rate)
             if self._clock_offset is None:
                 self._clock_offset = est

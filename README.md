@@ -1,93 +1,111 @@
 # Triton Neurotech — EMG BCI Workshop
 
-Control a game with your muscles using a MindRove armband **or an OpenBCI Ganglion** and Python.
+Control a game with your muscles. A MindRove armband or an OpenBCI Ganglion reads the
+electrical activity of your forearm, Python turns it into a trigger, and you play a
+dinosaur-style jump game with your fist.
 
 ---
 
-## What You'll Build
+## Quick start (5 minutes)
 
-A real-time EMG (electromyography) pipeline that:
-1. Reads muscle signals from a MindRove 4-channel WiFi armband
-2. Processes the signal to detect muscle contractions
-3. Uses contractions as input to control a jump game
+You need **Python 3.10 or newer**. Check with `python3 --version` (macOS/Linux) or
+`py --version` (Windows). If you don't have it, install it from
+<https://www.python.org/downloads/> — on Windows tick **"Add python.exe to PATH"**.
+
+**1. Get the code**
+
+```bash
+git clone https://github.com/uddhavp22/Triton-Neurotech-EMG-Workshop.git
+cd Triton-Neurotech-EMG-Workshop
+```
+
+(or download the ZIP from GitHub and unzip it)
+
+**2. Run the setup script once**
+
+| macOS / Linux | Windows |
+|---|---|
+| `./setup.sh` | double-click `setup.bat` |
+
+It creates a private Python environment in `.venv`, installs the packages, and prints a
+checklist. Everything should say `ok`.
+
+**3. Try it with no hardware**
+
+| macOS / Linux | Windows |
+|---|---|
+| `./run.sh --keyboard` | `run.bat --keyboard` |
+
+The app opens. Click **Jump game**, then **Start**, and hold **Space** to "flex". If this
+works, your machine is ready — the only thing left is the signal source below.
+
+**4. Connect a device and play**
+
+| macOS / Linux | Windows |
+|---|---|
+| `./run.sh` | `run.bat` |
+
+With no flags the app looks for a signal in this order: an LSL stream (MindRove Connect or
+the OpenBCI GUI) → OpenBCI GUI UDP → MindRove armband direct → synthetic. The status in the
+top-right corner of the menu tells you which one it found.
+
+<details>
+<summary>Prefer to do it by hand instead of the scripts?</summary>
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python check_setup.py
+python main.py --keyboard
+```
+</details>
 
 ---
 
-## Hardware Setup
+## Command-line options
 
-### Wearing the Armband
+| Flag | What it does |
+|---|---|
+| *(none)* | auto-detect: LSL → OpenBCI UDP → MindRove SDK → synthetic |
+| `--keyboard` | test mode, no device: hold **Space** to flex |
+| `--synthetic` | fake signal with a flex every few seconds |
+| `--channels 1` | show only these channels (1-based, comma-separated) |
+| `--backend lsl` / `udp` / `sdk` / `ganglion` | force one source instead of auto-detecting |
+| `--ganglion` | OpenBCI Ganglion over Bluetooth, no GUI needed |
+| `--help` | everything else |
 
-1. Put the MindRove armband on your **forearm**, about 2–3 finger-widths below the elbow
+Pass flags through the scripts the same way: `./run.sh --channels 1`, `run.bat --keyboard`.
+
+---
+
+## Using a MindRove armband
+
+### Wearing it
+
+1. Put the armband on your **forearm**, about 2–3 finger-widths below the elbow
 2. The electrodes should sit snugly against the skin — not too tight, not loose
 3. Make a fist and feel where the muscles bulge — that's where you want the sensors
 4. If signal is weak, try rotating the band slightly or moistening the skin
 
-### Connecting to Wi-Fi
+### Connecting
 
-The MindRove armband creates its own Wi-Fi hotspot.
+The armband creates its own Wi-Fi hotspot.
 
 1. Power on the armband (hold the button until the LED blinks)
-2. On your laptop, connect to the Wi-Fi network: **`MindRove_XXXX`** (the ID is on the band)
-3. Password: `mindrove` (default)
-4. Your laptop will now be connected to the armband's network — internet won't work while connected
+2. On your laptop connect to the Wi-Fi network **`MindRove_XXXX`** (the ID is on the band), password `mindrove`
+3. Internet won't work while you're on the armband's network — that's normal
 
----
+### Streaming (recommended: MindRove Connect)
 
-## Software Setup
+MindRove Connect is a small app that talks to the armband and publishes an LSL stream.
 
-### 1. Install Python dependencies
+1. Download it from <https://github.com/MindRove/MindRoveSDK/releases> (look for `MindRoveConnect` for your OS)
+2. Open it while connected to the armband's Wi-Fi and click **Start LSL Stream**
+3. Leave it running and start the workshop app — it finds the stream on its own
 
-```bash
-pip install -r requirements.txt
-```
-
-This installs: `mindrove`, `numpy`, `pygame`, `pylsl`, `scipy`
-
-### 2. Install MindRove Connect (recommended — LSL stream)
-
-MindRove Connect is a small app that connects to the armband and publishes an LSL stream your Python code can read.
-
-**Download:** https://github.com/MindRove/MindRoveSDK/releases  
-(look for `MindRoveConnect` under the latest release for your OS)
-
-**Steps:**
-1. Open MindRove Connect
-2. Make sure you're connected to the armband's Wi-Fi
-3. Click **"Start LSL Stream"**
-4. You should see a green status indicator — the stream is now live
-5. Leave MindRove Connect running in the background
-
-> **Why LSL?** LSL (Lab Streaming Layer) is a standard protocol for real-time biosignal streaming. Using it means your Python code doesn't need to manage the hardware connection directly — MindRove Connect handles that.
-
-### 3. Run the workshop
-
-```bash
-python main.py
-```
-
-With no flags the app auto-detects a source in this order: LSL stream → OpenBCI GUI UDP → MindRove SDK → synthetic.
-
-The live view shows one trace per channel the source provides. Channels that carry nothing
-(switched off in the OpenBCI GUI, or padding in an LSL stream) are hidden automatically.
-To show only the electrodes you actually wired up, pass them explicitly:
-
-```bash
-python main.py --channels 1        # single Ganglion channel
-python main.py --channels 1,3      # two channels
-```
-
-Or, if you don't have the hardware yet, run in synthetic mode (fake flexes every few seconds):
-
-```bash
-python main.py --synthetic
-```
-
-To work on the UI or game mechanics without any signal, use keyboard test mode. Holding
-**Space** acts as a clench and goes through the exact same trigger and jump logic:
-
-```bash
-python main.py --keyboard
-```
+No MindRove Connect? The app can also talk to the armband directly through the `mindrove`
+package (`--backend sdk`).
 
 ---
 
@@ -117,9 +135,19 @@ feed the Ganglion into the game:
    - Several Ganglions nearby? `python main.py --ganglion --serial Ganglion-1234`
    - Using the BLED112 dongle? `python main.py --ganglion --serial-port /dev/cu.usbmodemXXXX`
 
-Ganglion raw samples carry a large DC offset. The input layer applies a 5 Hz high-pass for
-OpenBCI sources so the plots, calibration and threshold all work in the same µV range as the
-MindRove.
+Raw Ganglion samples carry a large DC offset and, on gel electrodes, a lot of motion
+artefact. The input layer applies a 20 Hz high-pass and a 60 Hz notch to OpenBCI sources so
+only muscle activity reaches the trigger. Leave the GUI's own filters off (Data Type
+**TimeSeriesRaw**) — the app does the filtering.
+
+**Getting a strong signal with plain electrodes**
+
+- Both channel electrodes go over the fat part of the forearm flexors (palm-side, a hand's
+  width below the elbow), 3–4 cm apart along the muscle. Reference on the bony elbow or wrist.
+- Press them down and re-wet or re-gel if the rest trace looks fuzzy. A hard fist should push
+  the activation meter well past 100 µV; if it only reaches 30, move the electrodes.
+- Clench without moving your wrist or forearm — movement, not muscle, is what makes the
+  trace jump around.
 
 ---
 
@@ -165,8 +193,8 @@ Speed ramps up with distance, and taller obstacles only appear once you are goin
 Calibration teaches the app the difference between your resting muscle signal and a flex. Always calibrate before playing.
 
 1. Click **Calibrate** on the main menu
-2. **Rest phase (5 s):** relax your arm completely — don't move
-3. **Flex phase (5 s):** repeatedly clench your fist firmly
+2. **Rest phase (10 s):** relax your arm completely — don't move
+3. **Flex phase (10 s):** clench your fist firmly and hold it
 4. The app computes a threshold and shows you a summary
 5. If the threshold looks too high or too low, calibrate again
 
@@ -182,36 +210,41 @@ After connecting, the terminal prints a channel signal report like:
            CH4 (idx  4):    8.2 µV  █
 ```
 
-Press `1`–`4` to switch to the channel with the highest signal. Channels marked `← try this` are good candidates.
+Click the channel chip with the strongest signal (or press `1`–`8`). Channels marked `← try this` are good candidates.
 
 ---
 
-## Architecture Overview
+## How it works
 
 ```
-MindRove armband
-      │
-      ▼  (Wi-Fi)
-MindRove Connect app  ──►  LSL stream  ──►  emg_input.py
-                                                  │
-                                            signal_processing.py
-                                            (rectify + smooth → µV scalar)
-                                                  │
-                                            controller.py
-                                            (threshold + debounce → trigger)
-                                                  │
-                                    ┌─────────────┴──────────────┐
+MindRove armband / OpenBCI Ganglion
+            │  Wi-Fi / Bluetooth / LSL / UDP
+            ▼
+      emg_input.py          raw samples, display buffer, stream clock
+            │
+   signal_processing.py     rectify + 90 ms smoothing → activation (µV)
+            │
+      calibration.py        rest/flex recordings → threshold
+            │
+      controller.py         threshold + hysteresis + release envelope → one trigger per clench
+            │
+         game.py            jump physics, obstacles, eras
+            │
+         main.py            PyQt6 UI: menu, calibration, game
 ```
 
 | File | What it does |
 |------|-------------|
-| `emg_input.py` | Connects to LSL or SDK, buffers raw EMG samples |
+| `main.py` | Main menu, calibration and game UI, wires everything together |
+| `emg_input.py` | Connects to LSL / UDP / MindRove / BrainFlow, buffers raw EMG samples |
 | `signal_processing.py` | Rectifies + smooths signal into a single activation value (µV) |
 | `calibration.py` | Records rest/flex windows, computes detection threshold |
-| `controller.py` | Converts activation scalar → clean trigger with debounce & hysteresis |
-| `game.py` | Endless runner jump game |
-| `main.py` | Main menu, calibration and game UI, wires everything together |
+| `controller.py` | Converts activation into clean triggers with debounce & hysteresis |
+| `game.py` | Dinosaur-style jump game logic |
+| `check_setup.py` | Verifies the installation |
+| `setup.sh` / `setup.bat`, `run.sh` / `run.bat` | One-click install and launch |
 | `fonts/` | Bundled Manrope and DM Mono (SIL Open Font License) |
+| `workshop.ipynb` | Optional guided notebook |
 
 ---
 
@@ -224,6 +257,7 @@ Open `workshop.ipynb` for a guided, hands-on walkthrough where you'll:
 - Connect it to the full pipeline
 
 ```bash
+pip install jupyter
 jupyter notebook workshop.ipynb
 ```
 
@@ -254,6 +288,26 @@ jupyter notebook workshop.ipynb
 - Re-calibrate and relax more during the rest phase
 - Or drag the threshold slider on the last calibration step
 
+**`python` is not recognised / wrong version**
+- Windows: use `py -3` instead of `python`, or re-run the Python installer and tick "Add python.exe to PATH"
+- macOS: `python3` is the right name; the scripts handle this for you
+- The app needs Python 3.10+: `python3 --version`
+
+**Setup script fails installing a package**
+- Make sure you're online; the first install downloads ~200 MB (Qt is most of it)
+- Run `python check_setup.py` to see exactly what's missing, then `pip install <name>`
+- Only `numpy`, `scipy`, `PyQt6` and `pyqtgraph` are essential — the app runs in `--keyboard` and `--synthetic` mode without the device packages
+
+**Linux: window doesn't open / "could not load the Qt platform plugin xcb"**
+- `sudo apt install libxcb-cursor0 libxcb-xinerama0 libegl1` (Debian/Ubuntu), then try again
+
+**Windows: `--ganglion` can't find the board**
+- BrainFlow needs the Ganglion to be unpaired in Windows Bluetooth settings (it connects on its own)
+- Or use the OpenBCI GUI route (Networking → LSL) instead
+
+**Fonts look different / plain**
+- The app bundles its fonts in `fonts/`; make sure that folder came along if you copied the project
+
 **App crashes on import**
-- Run `pip install -r requirements.txt` again
-- Make sure you're using Python 3.10+: `python --version`
+- Run the setup script again (or `pip install -r requirements.txt`)
+- Make sure the terminal is using the `.venv` Python: `./run.sh` / `run.bat` do this for you

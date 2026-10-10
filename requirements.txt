@@ -1,9 +1,10 @@
-mindrove
-numpy
-pygame
-pylsl
-pyautogui
-scipy
-PyQt6
-pyqtgraph
-brainflow
+# Core (always needed)
+numpy>=1.26
+scipy>=1.11
+PyQt6>=6.6
+pyqtgraph>=0.13.3
+
+# Signal sources (each is optional at runtime; the app falls back to synthetic if missing)
+pylsl>=1.16          # LSL stream from MindRove Connect or the OpenBCI GUI (bundles liblsl)
+mindrove>=5.0        # MindRove armband direct Wi-Fi connection
+brainflow>=5.10      # OpenBCI Ganglion direct Bluetooth connection

@@ -95,10 +95,11 @@ def load_fonts():
             fams = QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []
             ok_ui   |= "Manrope" in fams
             ok_mono |= "DM Mono" in fams
+    fams = set(QFontDatabase.families())
     if not ok_ui:
-        FONT_UI = "Avenir Next" if "Avenir Next" in QFontDatabase.families() else "Helvetica Neue"
+        FONT_UI = next((f for f in ("Avenir Next", "Segoe UI", "Helvetica Neue", "DejaVu Sans") if f in fams), "")
     if not ok_mono:
-        FONT_MONO = "Menlo"
+        FONT_MONO = next((f for f in ("Menlo", "Consolas", "DejaVu Sans Mono") if f in fams), "")
 
 
 # ── Stylesheet ────────────────────────────────────────────────────────────────
@@ -652,7 +653,9 @@ class MenuPage(QWidget):
         if self._mode_note:
             txt, col = f"● {self._mode_note}", "#2E96D6"
         elif bk == 'synthetic':
-            txt, col = "● synthetic signal", "#2E96D6"
+            txt, col = "● synthetic signal — no device found", "#E04E4E"
+        elif not self._emg.is_alive():
+            txt, col = f"● {self._emg.source_name[:30]} — NO DATA", "#E04E4E"
         else:
             txt, col = f"● {self._emg.source_name[:34]}  {self._emg.sampling_rate} Hz", "#2FAF77"
         if self._status_lbl.text() != txt:
@@ -1061,11 +1064,11 @@ class CalibrationPage(QWidget):
                     f"FLEX p25: {self._cal.flex_p25:.1f} µV"
                 )
                 self._cal_summary.setText(self._cal.summary())
-                quality = (
-                    "Good separation"
-                    if self._cal.quality_margin >= 8.0
-                    else "Weak separation — try flexing harder"
-                )
+                if self._cal.quality_margin >= 8.0:
+                    quality = "Good separation"
+                else:
+                    quality = ("Weak separation — press the electrodes firmly over the muscle "
+                               "belly, re-wet them, clench hard, then redo flex")
                 qc = "#2FAF77" if self._cal.quality_margin >= 8.0 else "#2E96D6"
                 self._quality_lbl.setText(quality)
                 self._quality_lbl.setStyleSheet(f"color: {qc};")
