@@ -2,7 +2,8 @@
 emg_input.py — EMG input (MindRove / OpenBCI Ganglion) with threaded pull/peek buffering.
 
 Backends (auto order):
-1. "lsl"       LSL stream — MindRove Connect, or OpenBCI GUI → Networking → LSL
+1. "lsl"       LSL stream — MindRove Connect, OpenBCI GUI → Networking → LSL,
+               or a Meta Neural Band through RawMeta (`rawmeta stream`)
 2. "udp"       OpenBCI GUI → Networking → UDP (JSON time-series on 127.0.0.1:12345)
 3. "sdk"       Direct MindRove SDK (armband Wi-Fi)
 4. "synthetic" Fallback
@@ -64,6 +65,16 @@ KNOWN_RATES      = (125, 200, 250, 500, 1000, 1600)
 EMG_HIGHPASS_HZ  = 20.0
 MAINS_HZ         = 60.0
 
+# LSL streams faster than this are reduced to about 500 Hz on the way in. The Meta Neural
+# Band sends 2048 Hz; the app only needs the EMG envelope, and drawing 4x the points per
+# frame makes the display choppy.
+LSL_MAX_RATE_HZ  = 1000
+LSL_TARGET_RATE_HZ = 500
+
+
+# Stream name / source-id fragments that identify a Meta Neural Band published by RawMeta.
+META_BAND_KEYS = ("rawmeta", "nbstream", "metaneuralband")
+
 
 class EMGInput:
     def __init__(self, synthetic: bool = False, preferred_backend: str = "auto",
@@ -104,6 +115,10 @@ class EMGInput:
 
         # LSL state
         self._lsl_inlet = None
+        self._decim_q: int = 1                 # keep every q-th sample of a fast LSL stream
+        self._decim_ba = None                  # anti-alias low-pass applied before decimating
+        self._decim_zi = None
+        self._decim_phase: int = 0
 
         # UDP state (OpenBCI GUI JSON)
         self._udp_sock: socket.socket | None = None
@@ -300,15 +315,17 @@ class EMGInput:
             self._channel_indices = list(range(n_ch))
             self.emg_channels = list(range(n_ch))
             self.channel_labels = [f"CH{i + 1}" for i in range(n_ch)]
-            self.sampling_rate = int(stream.nominal_srate()) if stream.nominal_srate() > 0 else 500
+            native_rate = int(round(stream.nominal_srate())) if stream.nominal_srate() > 0 else 500
+            self._setup_decimation(native_rate)
+            self.sampling_rate = native_rate // self._decim_q
             self.synthetic = False
             self.backend = "lsl"
             self.source_name = f"{stream.name()} ({stream.type()})"
 
             ident = f"{stream.name()} {stream.source_id()}".lower()
-            if (any(k in ident for k in ("obci", "openbci", "ganglion", "cyton"))
+            if (any(k in ident for k in ("obci", "openbci", "ganglion", "cyton") + META_BAND_KEYS)
                     or stream.type().lower() == "eeg"):
-                # OpenBCI GUI streams raw samples with a large electrode offset.
+                # These sources send raw samples: remove electrode offset, drift and mains hum.
                 self._enable_dc_highpass()
 
             self._init_buffers()
@@ -552,6 +569,24 @@ class EMGInput:
             if valid:
                 self._append_chunk(arr[valid, :])
 
+    def _setup_decimation(self, native_rate: int):
+        """Fast LSL streams are low-passed and thinned to ~500 Hz (see LSL_MAX_RATE_HZ)."""
+        self._decim_q, self._decim_ba, self._decim_zi, self._decim_phase = 1, None, None, 0
+        if native_rate > LSL_MAX_RATE_HZ:
+            self._decim_q = max(1, round(native_rate / LSL_TARGET_RATE_HZ))
+            # Low-pass at 80% of the new Nyquist so nothing folds back when samples are dropped.
+            self._decim_ba = butter(4, 0.8 / self._decim_q, btype="low")
+
+    def _decimate(self, arr: np.ndarray) -> np.ndarray:
+        """arr: (channels, n) at the native rate → (channels, ~n/q). Keeps filter state and phase."""
+        b, a = self._decim_ba
+        if self._decim_zi is None or self._decim_zi.shape[0] != arr.shape[0]:
+            self._decim_zi = np.outer(arr[:, 0], lfilter_zi(b, a))    # start settled: no spike from a DC offset
+        arr, self._decim_zi = lfilter(b, a, arr, axis=1, zi=self._decim_zi)
+        out = arr[:, self._decim_phase::self._decim_q]
+        self._decim_phase = (self._decim_phase - arr.shape[1]) % self._decim_q
+        return out
+
     def _enable_dc_highpass(self):
         """20 Hz 2nd-order high-pass + 60 Hz notch, applied per channel in _append_chunk."""
         sr = max(1, self.sampling_rate)
@@ -675,6 +710,8 @@ class EMGInput:
             score_val = 0
             if "mindrove" in name or "mindrove" in source:
                 score_val += 8
+            if any(k in name or k in source for k in META_BAND_KEYS):
+                score_val += 8
             if any(k in name or k in source for k in ("obci", "openbci", "ganglion")):
                 score_val += 8
             if stype == preferred_type.lower():
@@ -710,8 +747,19 @@ class EMGInput:
             else:
                 arr = arr.T
 
+            # RawMeta marks a dropped Bluetooth batch with NaN samples. One NaN would stick in
+            # the filters and the trigger forever, so drop those samples (a few ms) here.
+            finite = np.isfinite(arr).all(axis=0)
+            if not finite.all():
+                arr = arr[:, finite]
+                if arr.shape[1] == 0:
+                    continue
+
             if self._channel_indices and arr.shape[0] > max(self._channel_indices):
-                self._append_chunk(arr[self._channel_indices, :])
+                arr = arr[self._channel_indices, :]
+                if self._decim_ba is not None:
+                    arr = self._decimate(arr)
+                self._append_chunk(arr)
 
     def _sdk_loop(self):
         idle_sleep = 0.005

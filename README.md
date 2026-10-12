@@ -1,7 +1,7 @@
 # Triton Neurotech — EMG BCI Workshop
 
-Control a game with your muscles. A MindRove armband or an OpenBCI Ganglion reads the
-electrical activity of your forearm, Python turns it into a trigger, and you play a
+Control a game with your muscles. A MindRove armband, an OpenBCI Ganglion or a Meta Neural Band
+reads the electrical activity of your forearm, Python turns it into a trigger, and you play a
 dinosaur-style jump game with your fist.
 
 ---
@@ -67,7 +67,7 @@ python main.py --keyboard
 
 | Flag | What it does |
 |---|---|
-| *(none)* | auto-detect: LSL → OpenBCI UDP → MindRove SDK → synthetic |
+| *(none)* | auto-detect: LSL (MindRove Connect, OpenBCI GUI, or a Meta Neural Band via RawMeta) → OpenBCI UDP → MindRove SDK → synthetic |
 | `--keyboard` | test mode, no device: hold **Space** to flex |
 | `--synthetic` | fake signal with a flex every few seconds |
 | `--channels 1` | show only these channels (1-based, comma-separated) |
@@ -106,6 +106,39 @@ MindRove Connect is a small app that talks to the armband and publishes an LSL s
 
 No MindRove Connect? The app can also talk to the armband directly through the `mindrove`
 package (`--backend sdk`).
+
+---
+
+## Using a Meta Neural Band
+
+The Meta Neural Band (the wristband sold with Meta Ray-Ban Display) works through
+[RawMeta](https://github.com/Triton-Neurotech/RawMeta), which reads the band's raw EMG on a Mac
+and publishes it as an LSL stream. macOS only.
+
+1. Set up RawMeta and enroll the band once (see the RawMeta README): `rawmeta enroll`
+2. Put the band on, 2–3 finger-widths below the wrist bone, and start streaming:
+   ```bash
+   rawmeta stream
+   ```
+   Wait for `streaming raw EMG` at about 128 batch/s. Leave this terminal running.
+3. In a second terminal, start the workshop app. It finds the stream on its own:
+   ```bash
+   ./run.sh
+   ```
+   The header should read `MetaNeuralBand_EMG … 512 Hz`. To skip the auto-detect, use
+   `./run.sh --backend lsl`.
+4. Pick the channel that jumps most when you make a fist (the app suggests one), run the
+   calibration, then play.
+
+Good to know:
+
+* The band sends 2048 Hz. The app thins that to 512 Hz, which is plenty for the game and keeps
+  the display smooth.
+* The app applies its 20 Hz high-pass and 60 Hz notch to the band's raw signal, and skips the
+  few samples RawMeta marks as lost when Bluetooth drops a batch.
+* RawMeta Live (`python tools/emg_gui.py` in the RawMeta repo) can run at the same time. Both
+  read the same stream.
+* Never pair the band with the Meta AI phone app. A firmware update can break RawMeta.
 
 ---
 
