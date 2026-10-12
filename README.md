@@ -15,8 +15,8 @@ You need **Python 3.10 or newer**. Check with `python3 --version` (macOS/Linux) 
 **1. Get the code**
 
 ```bash
-git clone https://github.com/uddhavp22/Triton-Neurotech-EMG-Workshop.git
-cd Triton-Neurotech-EMG-Workshop
+git clone https://github.com/Triton-Neurotech/EMG-Workshop.git
+cd EMG-Workshop
 ```
 
 (or download the ZIP from GitHub and unzip it)
